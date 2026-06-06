@@ -8,48 +8,44 @@ import json
 
 app = Flask(__name__)
 
-# === إعدادات Bybit ===
 BYBIT_API_KEY    = os.environ.get("BYBIT_API_KEY", "YOUR_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "YOUR_API_SECRET")
 BYBIT_BASE_URL   = "https://api-demo.bybit.com"
+WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "my_super_secret_123")
 
-# سر مشترك بين n8n وهذا السيرفر
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "my_super_secret_123")
-
-# ============================================================
-# توليد توقيع Bybit (HMAC SHA256)
-# ============================================================
-def bybit_sign(params: dict) -> dict:
-    timestamp = str(int(time.time() * 1000))
-    recv_window = "5000"
-    param_str = json.dumps(params, separators=(',', ':'))
-    pre_sign = f"{timestamp}{BYBIT_API_KEY}{recv_window}{param_str}"
-    signature = hmac.new(
-        BYBIT_API_SECRET.encode("utf-8"),
-        pre_sign.encode("utf-8"),
+def sign(pre_sign: str) -> str:
+    return hmac.new(
+        BYBIT_API_SECRET.encode(),
+        pre_sign.encode(),
         hashlib.sha256
     ).hexdigest()
+
+def base_headers(timestamp: str, sig: str) -> dict:
     return {
         "X-BAPI-API-KEY"    : BYBIT_API_KEY,
         "X-BAPI-TIMESTAMP"  : timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "X-BAPI-SIGN"       : signature,
+        "X-BAPI-RECV-WINDOW": "5000",
+        "X-BAPI-SIGN"       : sig,
         "Content-Type"      : "application/json",
     }
 
-# ============================================================
-# التحقق من صحة الطلب القادم من n8n
-# ============================================================
+def get_headers(params: dict) -> dict:
+    ts = str(int(time.time() * 1000))
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    pre_sign = f"{ts}{BYBIT_API_KEY}5000{query}"
+    return base_headers(ts, sign(pre_sign))
+
+def post_headers(body: dict) -> dict:
+    ts = str(int(time.time() * 1000))
+    body_str = json.dumps(body, separators=(',', ':'))
+    pre_sign = f"{ts}{BYBIT_API_KEY}5000{body_str}"
+    return base_headers(ts, sign(pre_sign))
+
 def verify_webhook(req) -> bool:
     sig = req.headers.get("X-Webhook-Signature", "")
     return sig == WEBHOOK_SECRET
 
-# ============================================================
-# تنفيذ أمر شراء / بيع على Bybit
-# ============================================================
-def place_order(symbol: str, side: str, qty: float,
-                stop_loss: float, take_profit: float) -> dict:
-    endpoint = "/v5/order/create"
+def place_order(symbol, side, qty, stop_loss, take_profit):
     body = {
         "category"   : "spot",
         "symbol"     : symbol,
@@ -60,23 +56,13 @@ def place_order(symbol: str, side: str, qty: float,
         "takeProfit" : str(round(take_profit, 4)),
         "timeInForce": "IOC",
     }
-    headers = bybit_sign(body)
-    resp = requests.post(
-        BYBIT_BASE_URL + endpoint,
-        headers=headers,
-        json=body,
-        timeout=10
-    )
+    headers = post_headers(body)
+    resp = requests.post(BYBIT_BASE_URL + "/v5/order/create", headers=headers, json=body, timeout=10)
     return resp.json()
-
-# ============================================================
-# Endpoints
-# ============================================================
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "time": int(time.time())}), 200
-
 
 @app.route("/execute", methods=["POST"])
 def execute():
@@ -100,35 +86,19 @@ def execute():
     side = "Buy" if action == "BUY" else "Sell"
     result = place_order(symbol, side, qty, stop_loss, take_profit)
 
-    log_entry = {
-        "time"      : int(time.time()),
-        "symbol"    : symbol,
-        "action"    : action,
-        "qty"       : qty,
-        "stopLoss"  : stop_loss,
-        "takeProfit": take_profit,
-        "bybitResp" : result,
-    }
-    print(json.dumps(log_entry, ensure_ascii=False))
+    print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": action, "result": result}, ensure_ascii=False))
 
     if result.get("retCode") == 0:
         return jsonify({"status": "executed", "order": result}), 200
     else:
         return jsonify({"status": "bybit_error", "detail": result}), 502
 
-
 @app.route("/balance", methods=["GET"])
 def balance():
     params = {"accountType": "UNIFIED"}
-    headers = bybit_sign(params)
-    resp = requests.get(
-        BYBIT_BASE_URL + "/v5/account/wallet-balance",
-        headers=headers,
-        params=params,
-        timeout=10
-    )
+    headers = get_headers(params)
+    resp = requests.get(BYBIT_BASE_URL + "/v5/account/wallet-balance", headers=headers, params=params, timeout=10)
     return jsonify(resp.json()), 200
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
