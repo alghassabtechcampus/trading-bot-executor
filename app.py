@@ -11,29 +11,24 @@ app = Flask(__name__)
 # === إعدادات Bybit ===
 BYBIT_API_KEY    = os.environ.get("BYBIT_API_KEY", "YOUR_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "YOUR_API_SECRET")
-BYBIT_BASE_URL   = "https://api-demo.bybit.com"   # Demo — غيّره إلى api.bybit.com للحساب الحقيقي
+BYBIT_BASE_URL   = "https://api-demo.bybit.com"
 
-# سر مشترك بين n8n وهذا السيرفر للتحقق من الطلبات
+# سر مشترك بين n8n وهذا السيرفر
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "my_super_secret_123")
 
 # ============================================================
-# توليد توقيع Bybit (HMAC SHA256) — الإصلاح الذي كان معلقاً
+# توليد توقيع Bybit (HMAC SHA256)
 # ============================================================
 def bybit_sign(params: dict) -> dict:
-    """يضيف timestamp وrecv_window والتوقيع لأي طلب Bybit"""
-    timestamp  = str(int(time.time() * 1000))
+    timestamp = str(int(time.time() * 1000))
     recv_window = "5000"
-
-    # ترتيب الـ params أبجدياً ثم بناء query string
-    sorted_params = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    pre_sign = f"{timestamp}{BYBIT_API_KEY}{recv_window}{sorted_params}"
-
+    param_str = json.dumps(params, separators=(',', ':'))
+    pre_sign = f"{timestamp}{BYBIT_API_KEY}{recv_window}{param_str}"
     signature = hmac.new(
         BYBIT_API_SECRET.encode("utf-8"),
         pre_sign.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
-
     return {
         "X-BAPI-API-KEY"    : BYBIT_API_KEY,
         "X-BAPI-TIMESTAMP"  : timestamp,
@@ -48,6 +43,7 @@ def bybit_sign(params: dict) -> dict:
 def verify_webhook(req) -> bool:
     sig = req.headers.get("X-Webhook-Signature", "")
     return sig == WEBHOOK_SECRET
+
 # ============================================================
 # تنفيذ أمر شراء / بيع على Bybit
 # ============================================================
@@ -57,7 +53,7 @@ def place_order(symbol: str, side: str, qty: float,
     body = {
         "category"   : "spot",
         "symbol"     : symbol,
-        "side"       : side,           # "Buy" أو "Sell"
+        "side"       : side,
         "orderType"  : "Market",
         "qty"        : str(qty),
         "stopLoss"   : str(round(stop_loss, 4)),
@@ -84,19 +80,6 @@ def health():
 
 @app.route("/execute", methods=["POST"])
 def execute():
-    """
-    يستقبل إشارة من n8n وينفذها على Bybit.
-    Body مثال:
-    {
-      "symbol": "BTCUSDT",
-      "action": "BUY",
-      "price": 65000,
-      "stopLoss": 64350,
-      "takeProfit": 67600,
-      "qty": 0.001
-    }
-    """
-    # التحقق من التوقيع
     if not verify_webhook(request):
         return jsonify({"error": "Unauthorized — invalid signature"}), 401
 
@@ -106,7 +89,7 @@ def execute():
         return jsonify({"error": f"Missing fields. Required: {required}"}), 400
 
     symbol      = data["symbol"].upper()
-    action      = data["action"].upper()   # BUY أو SELL
+    action      = data["action"].upper()
     stop_loss   = float(data["stopLoss"])
     take_profit = float(data["takeProfit"])
     qty         = float(data["qty"])
@@ -115,10 +98,8 @@ def execute():
         return jsonify({"error": "action must be BUY or SELL"}), 400
 
     side = "Buy" if action == "BUY" else "Sell"
-
     result = place_order(symbol, side, qty, stop_loss, take_profit)
 
-    # تسجيل في الـ log
     log_entry = {
         "time"      : int(time.time()),
         "symbol"    : symbol,
@@ -138,7 +119,6 @@ def execute():
 
 @app.route("/balance", methods=["GET"])
 def balance():
-    """جلب رصيد الحساب"""
     params = {"accountType": "UNIFIED"}
     headers = bybit_sign(params)
     resp = requests.get(
