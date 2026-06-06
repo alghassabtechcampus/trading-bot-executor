@@ -39,6 +39,7 @@ def post_headers(body: dict) -> dict:
     ts = str(int(time.time() * 1000))
     body_str = json.dumps(body, separators=(',', ':'))
     pre_sign = f"{ts}{BYBIT_API_KEY}5000{body_str}"
+    print(f"POST pre_sign: {pre_sign}", flush=True)
     return base_headers(ts, sign(pre_sign))
 
 def verify_webhook(req) -> bool:
