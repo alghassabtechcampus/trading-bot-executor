@@ -55,11 +55,6 @@ def place_order(symbol, side, qty, stop_loss, take_profit):
         "qty"        : str(qty),
         "timeInForce": "IOC",
     }
-    if stop_loss and float(stop_loss) > 0:
-        body["stopLoss"] = str(stop_loss)
-    if take_profit and float(take_profit) > 0:
-        body["takeProfit"] = str(take_profit)
-    
     body_str = json.dumps(body, separators=(',', ':'))
     headers = post_headers(body)
     resp = requests.post(
