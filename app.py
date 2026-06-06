@@ -57,8 +57,14 @@ def place_order(symbol, side, qty, stop_loss, take_profit):
         "takeProfit" : str(take_profit),
         "timeInForce": "IOC",
     }
+    body_str = json.dumps(body, separators=(',', ':'))
     headers = post_headers(body)
-    resp = requests.post(BYBIT_BASE_URL + "/v5/order/create", headers=headers, json=body, timeout=10)
+    resp = requests.post(
+        BYBIT_BASE_URL + "/v5/order/create",
+        headers=headers,
+        data=body_str,
+        timeout=10
+    )
     return resp.json()
 
 @app.route("/health", methods=["GET"])
@@ -77,9 +83,9 @@ def execute():
 
     symbol      = data["symbol"].upper()
     action      = data["action"].upper()
-    stop_loss   = float(data["stopLoss"])
-    take_profit = float(data["takeProfit"])
-    qty         = float(data["qty"])
+    stop_loss   = data["stopLoss"]
+    take_profit = data["takeProfit"]
+    qty         = data["qty"]
 
     if action not in ("BUY", "SELL"):
         return jsonify({"error": "action must be BUY or SELL"}), 400
