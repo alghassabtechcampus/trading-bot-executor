@@ -53,10 +53,13 @@ def place_order(symbol, side, qty, stop_loss, take_profit):
         "side"       : side,
         "orderType"  : "Market",
         "qty"        : str(qty),
-        "stopLoss"   : str(stop_loss),
-        "takeProfit" : str(take_profit),
         "timeInForce": "IOC",
     }
+    if stop_loss and float(stop_loss) > 0:
+        body["stopLoss"] = str(stop_loss)
+    if take_profit and float(take_profit) > 0:
+        body["takeProfit"] = str(take_profit)
+    
     body_str = json.dumps(body, separators=(',', ':'))
     headers = post_headers(body)
     resp = requests.post(
@@ -66,7 +69,6 @@ def place_order(symbol, side, qty, stop_loss, take_profit):
         timeout=10
     )
     return resp.json()
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "time": int(time.time())}), 200
