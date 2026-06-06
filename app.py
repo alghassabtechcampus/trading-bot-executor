@@ -39,7 +39,6 @@ def post_headers(body: dict) -> dict:
     ts = str(int(time.time() * 1000))
     body_str = json.dumps(body, separators=(',', ':'))
     pre_sign = f"{ts}{BYBIT_API_KEY}5000{body_str}"
-    print(f"POST pre_sign: {pre_sign}", flush=True)
     return base_headers(ts, sign(pre_sign))
 
 def verify_webhook(req) -> bool:
@@ -64,6 +63,7 @@ def place_order(symbol, side, qty, stop_loss, take_profit):
         timeout=10
     )
     return resp.json()
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "time": int(time.time())}), 200
@@ -101,8 +101,70 @@ def execute():
 def balance():
     params = {"accountType": "UNIFIED"}
     headers = get_headers(params)
-    resp = requests.get(BYBIT_BASE_URL + "/v5/account/wallet-balance", headers=headers, params=params, timeout=10)
+    resp = requests.get(
+        BYBIT_BASE_URL + "/v5/account/wallet-balance",
+        headers=headers,
+        params=params,
+        timeout=10
+    )
     return jsonify(resp.json()), 200
+
+@app.route("/pnl", methods=["GET"])
+def pnl():
+    params = {
+        "category": "spot",
+        "limit": "50"
+    }
+    headers = get_headers(params)
+    resp = requests.get(
+        BYBIT_BASE_URL + "/v5/order/history",
+        headers=headers,
+        params=params,
+        timeout=10
+    )
+    data = resp.json()
+    
+    if data.get("retCode") != 0:
+        return jsonify(data), 200
+
+    orders = data.get("result", {}).get("list", [])
+    
+    summary = {}
+    for order in orders:
+        if order.get("orderStatus") != "Filled":
+            continue
+        symbol = order.get("symbol", "")
+        side = order.get("side", "")
+        qty = float(order.get("cumExecQty", 0))
+        value = float(order.get("cumExecValue", 0))
+        fee = float(order.get("cumExecFee", 0))
+        
+        if symbol not in summary:
+            summary[symbol] = {"buy_value": 0, "sell_value": 0, "buy_qty": 0, "sell_qty": 0, "fees": 0}
+        
+        if side == "Buy":
+            summary[symbol]["buy_value"] += value
+            summary[symbol]["buy_qty"] += qty
+        else:
+            summary[symbol]["sell_value"] += value
+            summary[symbol]["sell_qty"] += qty
+        
+        summary[symbol]["fees"] += fee
+
+    result_list = []
+    for symbol, s in summary.items():
+        pnl_val = s["sell_value"] - s["buy_value"] - s["fees"]
+        pnl_pct = (pnl_val / s["buy_value"] * 100) if s["buy_value"] > 0 else 0
+        result_list.append({
+            "symbol": symbol,
+            "pnl": round(pnl_val, 4),
+            "pnl_pct": round(pnl_pct, 2),
+            "fees": round(s["fees"], 4),
+            "buy_value": round(s["buy_value"], 4),
+            "sell_value": round(s["sell_value"], 4),
+        })
+
+    return jsonify({"result": result_list}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
