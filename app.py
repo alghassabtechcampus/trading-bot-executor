@@ -53,8 +53,8 @@ def place_order(symbol, side, qty, stop_loss, take_profit):
         "side"       : side,
         "orderType"  : "Market",
         "qty"        : str(qty),
-        "stopLoss"   : str(round(stop_loss, 4)),
-        "takeProfit" : str(round(take_profit, 4)),
+        "stopLoss"   : str(stop_loss),
+        "takeProfit" : str(take_profit),
         "timeInForce": "IOC",
     }
     headers = post_headers(body)
