@@ -47,14 +47,7 @@ def bybit_sign(params: dict) -> dict:
 # ============================================================
 def verify_webhook(req) -> bool:
     sig = req.headers.get("X-Webhook-Signature", "")
-    body = req.get_data()
-    expected = hmac.new(
-        WEBHOOK_SECRET.encode(),
-        body,
-        hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(sig, expected)
-
+    return sig == WEBHOOK_SECRET
 # ============================================================
 # تنفيذ أمر شراء / بيع على Bybit
 # ============================================================
