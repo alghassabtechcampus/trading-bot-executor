@@ -227,7 +227,7 @@ def sell():
         "symbol"     : symbol,
         "side"       : "Sell",
         "orderType"  : "Market",
-        "qty"        : str(round(qty, 6)),
+        "qty"        : str(round(qty, 4)),
         "timeInForce": "IOC",
     }
     body_str = json.dumps(body, separators=(',', ':'))
