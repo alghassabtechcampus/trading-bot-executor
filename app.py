@@ -123,12 +123,12 @@ def pnl():
         timeout=10
     )
     data = resp.json()
-    
+
     if data.get("retCode") != 0:
         return jsonify(data), 200
 
     orders = data.get("result", {}).get("list", [])
-    
+
     summary = {}
     for order in orders:
         if order.get("orderStatus") != "Filled":
@@ -138,17 +138,17 @@ def pnl():
         qty = float(order.get("cumExecQty", 0))
         value = float(order.get("cumExecValue", 0))
         fee = float(order.get("cumExecFee", 0))
-        
+
         if symbol not in summary:
             summary[symbol] = {"buy_value": 0, "sell_value": 0, "buy_qty": 0, "sell_qty": 0, "fees": 0}
-        
+
         if side == "Buy":
             summary[symbol]["buy_value"] += value
             summary[symbol]["buy_qty"] += qty
         else:
             summary[symbol]["sell_value"] += value
             summary[symbol]["sell_qty"] += qty
-        
+
         summary[symbol]["fees"] += fee
 
     result_list = []
@@ -165,11 +165,12 @@ def pnl():
         })
 
     return jsonify({"result": result_list}), 200
+
 @app.route("/check_position", methods=["GET"])
 def check_position():
     symbol = request.args.get("symbol", "")
     coin = symbol.replace("USDT", "")
-    
+
     params = {"accountType": "UNIFIED"}
     headers = get_headers(params)
     resp = requests.get(
@@ -179,10 +180,10 @@ def check_position():
         timeout=10
     )
     data = resp.json()
-    
+
     if data.get("retCode") != 0:
         return jsonify({"has_position": False}), 200
-    
+
     coins = data["result"]["list"][0]["coin"]
     for c in coins:
         if c["coin"] == coin:
@@ -190,7 +191,61 @@ def check_position():
             usd_value = float(c["usdValue"])
             if usd_value > 5:
                 return jsonify({"has_position": True, "balance": balance, "usd_value": usd_value}), 200
-    
+
     return jsonify({"has_position": False}), 200
+
+@app.route("/sell", methods=["POST"])
+def sell():
+    if not verify_webhook(request):
+        return jsonify({"error": "Unauthorized — invalid signature"}), 401
+
+    data = request.get_json(force=True)
+    symbol = data.get("symbol", "").upper()
+
+    coin = symbol.replace("USDT", "")
+    params = {"accountType": "UNIFIED"}
+    headers = get_headers(params)
+    resp = requests.get(
+        BYBIT_BASE_URL + "/v5/account/wallet-balance",
+        headers=headers,
+        params=params,
+        timeout=10
+    )
+    balance_data = resp.json()
+
+    qty = 0
+    for c in balance_data["result"]["list"][0]["coin"]:
+        if c["coin"] == coin:
+            qty = float(c["walletBalance"])
+            break
+
+    if qty <= 0:
+        return jsonify({"error": "No balance to sell"}), 400
+
+    body = {
+        "category"   : "spot",
+        "symbol"     : symbol,
+        "side"       : "Sell",
+        "orderType"  : "Market",
+        "qty"        : str(round(qty, 6)),
+        "timeInForce": "IOC",
+    }
+    body_str = json.dumps(body, separators=(',', ':'))
+    headers = post_headers(body)
+    resp = requests.post(
+        BYBIT_BASE_URL + "/v5/order/create",
+        headers=headers,
+        data=body_str,
+        timeout=10
+    )
+    result = resp.json()
+
+    print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": "SELL", "result": result}, ensure_ascii=False))
+
+    if result.get("retCode") == 0:
+        return jsonify({"status": "sold", "order": result}), 200
+    else:
+        return jsonify({"status": "bybit_error", "detail": result}), 502
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
