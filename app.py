@@ -64,6 +64,14 @@ def place_order(symbol, side, qty, stop_loss, take_profit):
     )
     return resp.json()
 
+def format_qty(coin: str, qty: float) -> str:
+    if coin in ["BTC", "ETH"]:
+        return "{:.6f}".format(qty)
+    elif coin in ["XRP", "ADA", "XLM", "DOT", "BNB", "LINK"]:
+        return "{:.2f}".format(qty)
+    else:
+        return "{:.4f}".format(qty)
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "time": int(time.time())}), 200
@@ -187,10 +195,10 @@ def check_position():
     coins = data["result"]["list"][0]["coin"]
     for c in coins:
         if c["coin"] == coin:
-            balance = float(c["walletBalance"])
+            bal = float(c["walletBalance"])
             usd_value = float(c["usdValue"])
             if usd_value > 5:
-                return jsonify({"has_position": True, "balance": balance, "usd_value": usd_value}), 200
+                return jsonify({"has_position": True, "balance": bal, "usd_value": usd_value}), 200
 
     return jsonify({"has_position": False}), 200
 
@@ -201,8 +209,8 @@ def sell():
 
     data = request.get_json(force=True)
     symbol = data.get("symbol", "").upper()
-
     coin = symbol.replace("USDT", "")
+
     params = {"accountType": "UNIFIED"}
     headers = get_headers(params)
     resp = requests.get(
@@ -222,12 +230,14 @@ def sell():
     if qty <= 0:
         return jsonify({"error": "No balance to sell"}), 400
 
+    qty_str = format_qty(coin, qty)
+
     body = {
         "category"   : "spot",
         "symbol"     : symbol,
         "side"       : "Sell",
         "orderType"  : "Market",
-        "qty"        : str(round(qty, 2)),
+        "qty"        : qty_str,
         "timeInForce": "IOC",
     }
     body_str = json.dumps(body, separators=(',', ':'))
@@ -240,7 +250,7 @@ def sell():
     )
     result = resp.json()
 
-    print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": "SELL", "result": result}, ensure_ascii=False))
+    print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": "SELL", "qty": qty_str, "result": result}, ensure_ascii=False))
 
     if result.get("retCode") == 0:
         return jsonify({"status": "sold", "order": result}), 200
