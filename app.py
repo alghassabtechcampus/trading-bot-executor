@@ -165,6 +165,32 @@ def pnl():
         })
 
     return jsonify({"result": result_list}), 200
-
+@app.route("/check_position", methods=["GET"])
+def check_position():
+    symbol = request.args.get("symbol", "")
+    coin = symbol.replace("USDT", "")
+    
+    params = {"accountType": "UNIFIED"}
+    headers = get_headers(params)
+    resp = requests.get(
+        BYBIT_BASE_URL + "/v5/account/wallet-balance",
+        headers=headers,
+        params=params,
+        timeout=10
+    )
+    data = resp.json()
+    
+    if data.get("retCode") != 0:
+        return jsonify({"has_position": False}), 200
+    
+    coins = data["result"]["list"][0]["coin"]
+    for c in coins:
+        if c["coin"] == coin:
+            balance = float(c["walletBalance"])
+            usd_value = float(c["usdValue"])
+            if usd_value > 5:
+                return jsonify({"has_position": True, "balance": balance, "usd_value": usd_value}), 200
+    
+    return jsonify({"has_position": False}), 200
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
