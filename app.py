@@ -54,7 +54,7 @@ def format_qty(coin: str, qty: float) -> str:
     elif coin in ["XRP", "ADA", "XLM", "DOT", "BNB", "LINK"]:
         return str(int(qty))
     else:
-        return "{:.4f}".format(qty)
+        return "{:.0f}".format(qty)
 
 def place_order(symbol, side, qty, stop_loss, take_profit):
     body = {
