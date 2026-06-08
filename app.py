@@ -237,10 +237,10 @@ def sell():
         if c["coin"] == coin:
             qty = float(c["walletBalance"])
             break
-
+        
     if qty <= 0:
         return jsonify({"error": "No balance to sell"}), 400
-
+    print(f"DEBUG: coin={coin} qty={qty} qty_str={format_qty(coin, qty)}", flush=True)
     qty_str = format_qty(coin, qty)
 
     body = {
