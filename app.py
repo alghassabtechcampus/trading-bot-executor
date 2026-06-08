@@ -233,7 +233,7 @@ def sell():
     qty = 0
     for c in balance_data["result"]["list"][0]["coin"]:
         if c["coin"] == coin:
-            qty = float(c["walletBalance"])
+            qty = float(c.get("availableToWithdraw", c["walletBalance"]))
             break
 
     if qty <= 0:
