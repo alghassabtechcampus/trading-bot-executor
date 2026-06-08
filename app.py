@@ -182,7 +182,6 @@ def check_position():
     symbol = request.args.get("symbol", "")
     coin = symbol.replace("USDT", "")
 
-    # تجاهل العملات الأصلية
     if coin in ORIGINAL_COINS:
         return jsonify({"has_position": False}), 200
 
@@ -204,7 +203,7 @@ def check_position():
         if c["coin"] == coin:
             bal = float(c["walletBalance"])
             usd_value = float(c["usdValue"])
-            if usd_value > 5 and coin not in ORIGINAL_COINS:
+            if usd_value > 5:
                 return jsonify({"has_position": True, "balance": bal, "usd_value": usd_value}), 200
 
     return jsonify({"has_position": False}), 200
@@ -218,7 +217,6 @@ def sell():
     symbol = data.get("symbol", "").upper()
     coin = symbol.replace("USDT", "")
 
-    # منع بيع العملات الأصلية
     if coin in ORIGINAL_COINS:
         return jsonify({"error": "Cannot sell original coin"}), 400
 
@@ -237,11 +235,12 @@ def sell():
         if c["coin"] == coin:
             qty = float(c["walletBalance"])
             break
-        
+
     if qty <= 0:
         return jsonify({"error": "No balance to sell"}), 400
-    print(f"DEBUG: coin={coin} qty={qty} qty_str={format_qty(coin, qty)}", flush=True)
+
     qty_str = format_qty(coin, qty)
+    print(f"DEBUG sell: coin={coin} qty={qty} qty_str={qty_str}", flush=True)
 
     body = {
         "category"   : "spot",
