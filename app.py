@@ -52,7 +52,7 @@ def format_qty(coin: str, qty: float) -> str:
     if coin in ["BTC", "ETH"]:
         return "{:.6f}".format(qty)
     elif coin in ["XRP", "ADA", "XLM", "DOT", "BNB", "LINK"]:
-        return "{:.2f}".format(qty)
+    return "{:.1f}".format(qty)
     else:
         return "{:.4f}".format(qty)
 
