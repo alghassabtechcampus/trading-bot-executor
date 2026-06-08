@@ -48,14 +48,6 @@ def verify_webhook(req) -> bool:
     sig = req.headers.get("X-Webhook-Signature", "")
     return sig == WEBHOOK_SECRET
 
-def format_qty(coin: str, qty: float) -> str:
-    if coin in ["BTC", "ETH"]:
-        return "{:.6f}".format(qty)
-    elif coin in ["XRP", "ADA", "XLM", "DOT", "BNB", "LINK"]:
-        return str(int(qty))
-    else:
-        return "{:.0f}".format(qty)
-
 def place_order(symbol, side, qty, stop_loss, take_profit):
     body = {
         "category"   : "spot",
@@ -220,6 +212,7 @@ def sell():
     if coin in ORIGINAL_COINS:
         return jsonify({"error": "Cannot sell original coin"}), 400
 
+    # جلب الرصيد والقيمة الدولارية
     params = {"accountType": "UNIFIED"}
     headers = get_headers(params)
     resp = requests.get(
@@ -231,24 +224,26 @@ def sell():
     balance_data = resp.json()
 
     qty = 0
+    usd_value = 0
     for c in balance_data["result"]["list"][0]["coin"]:
         if c["coin"] == coin:
-            avail = c.get("availableToWithdraw", "")
-            qty = float(avail) if avail else float(c["walletBalance"])
+            qty = float(c["walletBalance"])
+            usd_value = float(c["usdValue"])
             break
 
-    if qty <= 0:
+    if qty <= 0 or usd_value <= 0:
         return jsonify({"error": "No balance to sell"}), 400
 
-    qty_str = format_qty(coin, qty)
-    print(f"DEBUG sell: coin={coin} qty={qty} qty_str={qty_str}", flush=True)
+    # نبيع بالقيمة الدولارية (marketUnit=quoteCoin)
+    sell_amount = str(round(usd_value * 0.99, 2))
 
     body = {
         "category"   : "spot",
         "symbol"     : symbol,
         "side"       : "Sell",
         "orderType"  : "Market",
-        "qty"        : qty_str,
+        "marketUnit" : "quoteCoin",
+        "qty"        : sell_amount,
         "timeInForce": "IOC",
     }
     body_str = json.dumps(body, separators=(',', ':'))
@@ -261,7 +256,7 @@ def sell():
     )
     result = resp.json()
 
-    print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": "SELL", "qty": qty_str, "result": result}, ensure_ascii=False))
+    print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": "SELL", "amount_usd": sell_amount, "result": result}, ensure_ascii=False))
 
     if result.get("retCode") == 0:
         return jsonify({"status": "sold", "order": result}), 200
