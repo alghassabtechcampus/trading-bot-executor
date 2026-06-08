@@ -13,6 +13,9 @@ BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "YOUR_API_SECRET")
 BYBIT_BASE_URL   = "https://api-demo.bybit.com"
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "my_super_secret_123")
 
+# العملات الأصلية التي لا يلمسها البوت
+ORIGINAL_COINS = ["BTC", "ETH", "USDC"]
+
 def sign(pre_sign: str) -> str:
     return hmac.new(
         BYBIT_API_SECRET.encode(),
@@ -45,6 +48,14 @@ def verify_webhook(req) -> bool:
     sig = req.headers.get("X-Webhook-Signature", "")
     return sig == WEBHOOK_SECRET
 
+def format_qty(coin: str, qty: float) -> str:
+    if coin in ["BTC", "ETH"]:
+        return "{:.6f}".format(qty)
+    elif coin in ["XRP", "ADA", "XLM", "DOT", "BNB", "LINK"]:
+        return "{:.2f}".format(qty)
+    else:
+        return "{:.4f}".format(qty)
+
 def place_order(symbol, side, qty, stop_loss, take_profit):
     body = {
         "category"   : "spot",
@@ -63,14 +74,6 @@ def place_order(symbol, side, qty, stop_loss, take_profit):
         timeout=10
     )
     return resp.json()
-
-def format_qty(coin: str, qty: float) -> str:
-    if coin in ["BTC", "ETH"]:
-        return "{:.6f}".format(qty)
-    elif coin in ["XRP", "ADA", "XLM", "DOT", "BNB", "LINK"]:
-        return "{:.2f}".format(qty)
-    else:
-        return "{:.4f}".format(qty)
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -179,6 +182,10 @@ def check_position():
     symbol = request.args.get("symbol", "")
     coin = symbol.replace("USDT", "")
 
+    # تجاهل العملات الأصلية
+    if coin in ORIGINAL_COINS:
+        return jsonify({"has_position": False}), 200
+
     params = {"accountType": "UNIFIED"}
     headers = get_headers(params)
     resp = requests.get(
@@ -197,7 +204,7 @@ def check_position():
         if c["coin"] == coin:
             bal = float(c["walletBalance"])
             usd_value = float(c["usdValue"])
-            if usd_value > 5:
+            if usd_value > 5 and coin not in ORIGINAL_COINS:
                 return jsonify({"has_position": True, "balance": bal, "usd_value": usd_value}), 200
 
     return jsonify({"has_position": False}), 200
@@ -210,6 +217,10 @@ def sell():
     data = request.get_json(force=True)
     symbol = data.get("symbol", "").upper()
     coin = symbol.replace("USDT", "")
+
+    # منع بيع العملات الأصلية
+    if coin in ORIGINAL_COINS:
+        return jsonify({"error": "Cannot sell original coin"}), 400
 
     params = {"accountType": "UNIFIED"}
     headers = get_headers(params)
