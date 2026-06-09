@@ -290,8 +290,8 @@ def sell():
             usd_value = float(c["usdValue"])
             break
 
-    if usd_value <= 0:
-        return jsonify({"error": "No balance to sell"}), 400
+    if usd_value < 10:
+        return jsonify({"error": "Balance too small"}), 400
 
     sell_amount = str(round(usd_value * 0.99, 2))
 
