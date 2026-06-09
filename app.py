@@ -16,6 +16,20 @@ WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "my_super_secret_123")
 # العملات الأصلية التي لا يلمسها البوت
 ORIGINAL_COINS = ["BTC", "ETH", "USDC"]
 
+# ملف حفظ الصفقات
+TRADES_FILE = "/tmp/trades.json"
+
+def load_trades():
+    try:
+        with open(TRADES_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_trades(trades):
+    with open(TRADES_FILE, "w") as f:
+        json.dump(trades, f)
+
 def sign(pre_sign: str) -> str:
     return hmac.new(
         BYBIT_API_SECRET.encode(),
@@ -86,12 +100,23 @@ def execute():
     stop_loss   = data["stopLoss"]
     take_profit = data["takeProfit"]
     qty         = data["qty"]
+    price       = float(data["price"])
 
     if action not in ("BUY", "SELL"):
         return jsonify({"error": "action must be BUY or SELL"}), 400
 
     side = "Buy" if action == "BUY" else "Sell"
     result = place_order(symbol, side, qty, stop_loss, take_profit)
+
+    # احفظ سعر الشراء
+    if result.get("retCode") == 0 and action == "BUY":
+        trades = load_trades()
+        trades[symbol] = {
+            "buy_price": price,
+            "qty": qty,
+            "time": int(time.time())
+        }
+        save_trades(trades)
 
     print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": action, "result": result}, ensure_ascii=False))
 
@@ -111,6 +136,45 @@ def balance():
         timeout=10
     )
     return jsonify(resp.json()), 200
+
+@app.route("/positions", methods=["GET"])
+def positions():
+    """يرجع الصفقات المفتوحة مع سعر الشراء"""
+    trades = load_trades()
+    
+    params = {"accountType": "UNIFIED"}
+    headers = get_headers(params)
+    resp = requests.get(
+        BYBIT_BASE_URL + "/v5/account/wallet-balance",
+        headers=headers,
+        params=params,
+        timeout=10
+    )
+    balance_data = resp.json()
+    
+    result = []
+    for symbol, trade in trades.items():
+        coin = symbol.replace("USDT", "")
+        usd_value = 0
+        for c in balance_data["result"]["list"][0]["coin"]:
+            if c["coin"] == coin:
+                usd_value = float(c["usdValue"])
+                break
+        
+        if usd_value < 1:
+            continue
+            
+        buy_price = trade["buy_price"]
+        pnl_pct = ((usd_value - 100) / 100) * 100  # اشترينا بـ $100 دائماً
+        
+        result.append({
+            "symbol": symbol,
+            "buy_price": buy_price,
+            "usd_value": usd_value,
+            "pnl_pct": round(pnl_pct, 2)
+        })
+    
+    return jsonify({"result": result}), 200
 
 @app.route("/pnl", methods=["GET"])
 def pnl():
@@ -177,26 +241,24 @@ def check_position():
     if coin in ORIGINAL_COINS:
         return jsonify({"has_position": False}), 200
 
-    params = {"accountType": "UNIFIED"}
-    headers = get_headers(params)
-    resp = requests.get(
-        BYBIT_BASE_URL + "/v5/account/wallet-balance",
-        headers=headers,
-        params=params,
-        timeout=10
-    )
-    data = resp.json()
-
-    if data.get("retCode") != 0:
-        return jsonify({"has_position": False}), 200
-
-    coins = data["result"]["list"][0]["coin"]
-    for c in coins:
-        if c["coin"] == coin:
-            bal = float(c["walletBalance"])
-            usd_value = float(c["usdValue"])
-            if usd_value > 5:
-                return jsonify({"has_position": True, "balance": bal, "usd_value": usd_value}), 200
+    # تحقق من الذاكرة أولاً
+    trades = load_trades()
+    if symbol in trades:
+        # تحقق من الرصيد الفعلي
+        params = {"accountType": "UNIFIED"}
+        headers = get_headers(params)
+        resp = requests.get(
+            BYBIT_BASE_URL + "/v5/account/wallet-balance",
+            headers=headers,
+            params=params,
+            timeout=10
+        )
+        data = resp.json()
+        for c in data["result"]["list"][0]["coin"]:
+            if c["coin"] == coin:
+                usd_value = float(c["usdValue"])
+                if usd_value > 5:
+                    return jsonify({"has_position": True, "usd_value": usd_value}), 200
 
     return jsonify({"has_position": False}), 200
 
@@ -212,7 +274,6 @@ def sell():
     if coin in ORIGINAL_COINS:
         return jsonify({"error": "Cannot sell original coin"}), 400
 
-    # جلب الرصيد والقيمة الدولارية
     params = {"accountType": "UNIFIED"}
     headers = get_headers(params)
     resp = requests.get(
@@ -223,18 +284,15 @@ def sell():
     )
     balance_data = resp.json()
 
-    qty = 0
     usd_value = 0
     for c in balance_data["result"]["list"][0]["coin"]:
         if c["coin"] == coin:
-            qty = float(c["walletBalance"])
             usd_value = float(c["usdValue"])
             break
 
-    if qty <= 0 or usd_value <= 0:
+    if usd_value <= 0:
         return jsonify({"error": "No balance to sell"}), 400
 
-    # نبيع بالقيمة الدولارية (marketUnit=quoteCoin)
     sell_amount = str(round(usd_value * 0.99, 2))
 
     body = {
@@ -256,7 +314,13 @@ def sell():
     )
     result = resp.json()
 
-    print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": "SELL", "amount_usd": sell_amount, "result": result}, ensure_ascii=False))
+    # امسح من الذاكرة بعد البيع
+    if result.get("retCode") == 0:
+        trades = load_trades()
+        trades.pop(symbol, None)
+        save_trades(trades)
+
+    print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": "SELL", "result": result}, ensure_ascii=False))
 
     if result.get("retCode") == 0:
         return jsonify({"status": "sold", "order": result}), 200
