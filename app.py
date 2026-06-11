@@ -178,9 +178,11 @@ def positions():
 
 @app.route("/pnl", methods=["GET"])
 def pnl():
+    start_time = str(int((time.time() - 86400) * 1000))
     params = {
         "category": "spot",
-        "limit": "50"
+        "limit": "50",
+        "startTime": start_time
     }
     headers = get_headers(params)
     resp = requests.get(
@@ -190,12 +192,9 @@ def pnl():
         timeout=10
     )
     data = resp.json()
-
     if data.get("retCode") != 0:
         return jsonify(data), 200
-
     orders = data.get("result", {}).get("list", [])
-
     summary = {}
     for order in orders:
         if order.get("orderStatus") != "Filled":
