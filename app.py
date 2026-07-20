@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 BYBIT_API_KEY    = os.environ.get("BYBIT_API_KEY", "YOUR_API_KEY")
 BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "YOUR_API_SECRET")
-BYBIT_BASE_URL   = "https://api-demo.bybit.com"
+BYBIT_BASE_URL   = "https://api.bybit.com"
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "my_super_secret_123")
 
 # العملات الأصلية التي لا يلمسها البوت
