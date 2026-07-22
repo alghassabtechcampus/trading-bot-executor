@@ -13,10 +13,7 @@ BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "YOUR_API_SECRET")
 BYBIT_BASE_URL   = "https://api.bybit.com"
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "my_super_secret_123")
 
-# العملات الأصلية التي لا يلمسها البوت
 ORIGINAL_COINS = ["BTC", "ETH", "USDC"]
-
-# ملف حفظ الصفقات
 TRADES_FILE = "/tmp/trades.json"
 
 def load_trades():
@@ -88,12 +85,12 @@ def health():
 @app.route("/execute", methods=["POST"])
 def execute():
     if not verify_webhook(request):
-        return jsonify({"error": "Unauthorized — invalid signature"}), 401
+        return jsonify({"error": "Unauthorized"}), 401
 
     data = request.get_json(force=True)
     required = ["symbol", "action", "price", "stopLoss", "takeProfit", "qty"]
     if not all(k in data for k in required):
-        return jsonify({"error": f"Missing fields. Required: {required}"}), 400
+        return jsonify({"error": "Missing fields"}), 400
 
     symbol      = data["symbol"].upper()
     action      = data["action"].upper()
@@ -108,11 +105,11 @@ def execute():
     side = "Buy" if action == "BUY" else "Sell"
     result = place_order(symbol, side, qty, stop_loss, take_profit)
 
-    # احفظ سعر الشراء
     if result.get("retCode") == 0 and action == "BUY":
         trades = load_trades()
         trades[symbol] = {
             "buy_price": price,
+            "buy_value": 100,
             "qty": qty,
             "time": int(time.time())
         }
@@ -139,9 +136,8 @@ def balance():
 
 @app.route("/positions", methods=["GET"])
 def positions():
-    """يرجع الصفقات المفتوحة مع سعر الشراء"""
     trades = load_trades()
-    
+
     params = {"accountType": "UNIFIED"}
     headers = get_headers(params)
     resp = requests.get(
@@ -151,7 +147,7 @@ def positions():
         timeout=10
     )
     balance_data = resp.json()
-    
+
     result = []
     for symbol, trade in trades.items():
         coin = symbol.replace("USDT", "")
@@ -160,20 +156,22 @@ def positions():
             if c["coin"] == coin:
                 usd_value = float(c["usdValue"])
                 break
-        
-        if usd_value < 1:
+
+        if usd_value < 5:
             continue
-            
+
         buy_price = trade["buy_price"]
-        pnl_pct = ((usd_value - 100) / 100) * 100  # اشترينا بـ $100 دائماً
-        
+        buy_value = trade.get("buy_value", 100)
+        pnl_pct = ((usd_value - buy_value) / buy_value) * 100
+
         result.append({
             "symbol": symbol,
             "buy_price": buy_price,
+            "buy_value": buy_value,
             "usd_value": usd_value,
             "pnl_pct": round(pnl_pct, 2)
         })
-    
+
     return jsonify({"result": result}), 200
 
 @app.route("/pnl", methods=["GET"])
@@ -192,28 +190,28 @@ def pnl():
         timeout=10
     )
     data = resp.json()
+
     if data.get("retCode") != 0:
         return jsonify(data), 200
+
     orders = data.get("result", {}).get("list", [])
+
     summary = {}
     for order in orders:
         if order.get("orderStatus") != "Filled":
             continue
         symbol = order.get("symbol", "")
         side = order.get("side", "")
-        qty = float(order.get("cumExecQty", 0))
         value = float(order.get("cumExecValue", 0))
         fee = float(order.get("cumExecFee", 0))
 
         if symbol not in summary:
-            summary[symbol] = {"buy_value": 0, "sell_value": 0, "buy_qty": 0, "sell_qty": 0, "fees": 0}
+            summary[symbol] = {"buy_value": 0, "sell_value": 0, "fees": 0}
 
         if side == "Buy":
             summary[symbol]["buy_value"] += value
-            summary[symbol]["buy_qty"] += qty
         else:
             summary[symbol]["sell_value"] += value
-            summary[symbol]["sell_qty"] += qty
 
         summary[symbol]["fees"] += fee
 
@@ -240,10 +238,8 @@ def check_position():
     if coin in ORIGINAL_COINS:
         return jsonify({"has_position": False}), 200
 
-    # تحقق من الذاكرة أولاً
     trades = load_trades()
     if symbol in trades:
-        # تحقق من الرصيد الفعلي
         params = {"accountType": "UNIFIED"}
         headers = get_headers(params)
         resp = requests.get(
@@ -264,7 +260,7 @@ def check_position():
 @app.route("/sell", methods=["POST"])
 def sell():
     if not verify_webhook(request):
-        return jsonify({"error": "Unauthorized — invalid signature"}), 401
+        return jsonify({"error": "Unauthorized"}), 401
 
     data = request.get_json(force=True)
     symbol = data.get("symbol", "").upper()
@@ -313,7 +309,6 @@ def sell():
     )
     result = resp.json()
 
-    # امسح من الذاكرة بعد البيع
     if result.get("retCode") == 0:
         trades = load_trades()
         trades.pop(symbol, None)
