@@ -294,22 +294,29 @@ def sell():
     if usd_value < 10:
         return jsonify({"error": "Balance too small"}), 400
 
-    # تحديد دقة الأرقام العشرية حسب العملة
+    # BTC و ETH نبيع بالكمية
     if coin in ["BTC", "ETH"]:
         qty_str = "{:.6f}".format(qty_balance)
-    elif coin in ["XRP", "BNB", "LINK"]:
-        qty_str = "{:.2f}".format(qty_balance)
+        body = {
+            "category"   : "spot",
+            "symbol"     : symbol,
+            "side"       : "Sell",
+            "orderType"  : "Market",
+            "qty"        : qty_str,
+            "timeInForce": "IOC",
+        }
     else:
-        qty_str = "{:.4f}".format(qty_balance)
-
-    body = {
-        "category"   : "spot",
-        "symbol"     : symbol,
-        "side"       : "Sell",
-        "orderType"  : "Market",
-        "qty"        : qty_str,
-        "timeInForce": "IOC",
-    }
+        # باقي العملات نبيع بالقيمة الدولارية
+        sell_amount = str(round(usd_value * 0.999, 2))
+        body = {
+            "category"   : "spot",
+            "symbol"     : symbol,
+            "side"       : "Sell",
+            "orderType"  : "Market",
+            "marketUnit" : "quoteCoin",
+            "qty"        : sell_amount,
+            "timeInForce": "IOC",
+        }
     body_str = json.dumps(body, separators=(',', ':'))
     headers = post_headers(body)
     resp = requests.post(
