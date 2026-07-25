@@ -284,23 +284,30 @@ def sell():
     balance_data = resp.json()
 
     usd_value = 0
+    qty_balance = 0
     for c in balance_data["result"]["list"][0]["coin"]:
         if c["coin"] == coin:
             usd_value = float(c["usdValue"])
+            qty_balance = float(c["walletBalance"])
             break
 
     if usd_value < 10:
         return jsonify({"error": "Balance too small"}), 400
 
-    sell_amount = str(round(usd_value * 0.99, 2))
+    # تحديد دقة الأرقام العشرية حسب العملة
+    if coin in ["BTC", "ETH"]:
+        qty_str = "{:.6f}".format(qty_balance)
+    elif coin in ["XRP", "BNB", "LINK"]:
+        qty_str = "{:.2f}".format(qty_balance)
+    else:
+        qty_str = "{:.4f}".format(qty_balance)
 
     body = {
         "category"   : "spot",
         "symbol"     : symbol,
         "side"       : "Sell",
         "orderType"  : "Market",
-        "marketUnit" : "quoteCoin",
-        "qty"        : sell_amount,
+        "qty"        : qty_str,
         "timeInForce": "IOC",
     }
     body_str = json.dumps(body, separators=(',', ':'))
