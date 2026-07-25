@@ -176,7 +176,8 @@ def positions():
 
 @app.route("/pnl", methods=["GET"])
 def pnl():
-    start_time = str(int((time.time() - 86400) * 1000))
+    hours = request.args.get("hours", "24")
+    start_time = str(int((time.time() - int(hours) * 3600) * 1000))
     params = {
         "category": "spot",
         "limit": "50",
@@ -217,6 +218,9 @@ def pnl():
 
     result_list = []
     for symbol, s in summary.items():
+        # فقط الصفقات المكتملة (تم البيع فعلاً)
+        if s["sell_value"] < 5:
+            continue
         pnl_val = s["sell_value"] - s["buy_value"] - s["fees"]
         pnl_pct = (pnl_val / s["buy_value"] * 100) if s["buy_value"] > 0 else 0
         result_list.append({
