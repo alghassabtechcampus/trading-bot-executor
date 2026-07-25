@@ -294,19 +294,15 @@ def sell():
     if usd_value < 10:
         return jsonify({"error": "Balance too small"}), 400
 
-    # BTC و ETH نبيع بالكمية
+    # نبيع الكمية ناقص 0.1% عمولة البيع
     if coin in ["BTC", "ETH"]:
-        qty_str = "{:.6f}".format(qty_balance)
-        body = {
-            "category"   : "spot",
-            "symbol"     : symbol,
-            "side"       : "Sell",
-            "orderType"  : "Market",
-            "qty"        : qty_str,
-            "timeInForce": "IOC",
-        }
+        qty_after_fee = qty_balance * 0.999
+        qty_str = "{:.6f}".format(qty_after_fee)
+    elif coin in ["XRP", "BNB"]:
+        qty_after_fee = qty_balance * 0.999
+        qty_str = "{:.2f}".format(qty_after_fee)
     else:
-        # باقي العملات نبيع بالقيمة الدولارية
+        # LINK وغيرها نبيع بالقيمة الدولارية ناقص العمولة
         sell_amount = str(round(usd_value * 0.999, 2))
         body = {
             "category"   : "spot",
@@ -317,6 +313,28 @@ def sell():
             "qty"        : sell_amount,
             "timeInForce": "IOC",
         }
+        body_str = json.dumps(body, separators=(",", ":"))
+        headers = post_headers(body)
+        resp = requests.post(BYBIT_BASE_URL + "/v5/order/create", headers=headers, data=body_str, timeout=10)
+        result = resp.json()
+        if result.get("retCode") == 0:
+            trades = load_trades()
+            trades.pop(symbol, None)
+            save_trades(trades)
+        print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": "SELL", "result": result}, ensure_ascii=False))
+        if result.get("retCode") == 0:
+            return jsonify({"status": "sold", "order": result}), 200
+        else:
+            return jsonify({"status": "bybit_error", "detail": result}), 502
+
+    body = {
+        "category"   : "spot",
+        "symbol"     : symbol,
+        "side"       : "Sell",
+        "orderType"  : "Market",
+        "qty"        : qty_str,
+        "timeInForce": "IOC",
+    }
     body_str = json.dumps(body, separators=(',', ':'))
     headers = post_headers(body)
     resp = requests.post(
