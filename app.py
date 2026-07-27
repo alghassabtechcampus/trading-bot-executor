@@ -296,7 +296,7 @@ def sell():
         return jsonify({"error": "Balance too small"}), 400
 
     # نبيع الكمية ناقص 0.1% عمولة البيع
-    if coin in ["BTC", "ETH"]:
+    if coin in ["BTC", "ETH", "BNB"]:
         qty_after_fee = qty_balance * 0.999
         qty_str = "{:.6f}".format(qty_after_fee)
     elif coin in ["XRP", "BNB"]:
