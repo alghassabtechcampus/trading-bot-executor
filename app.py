@@ -168,6 +168,7 @@ def positions():
             "symbol": symbol,
             "buy_price": buy_price,
             "buy_value": buy_value,
+            "buy_time": trade.get("time", 0),
             "usd_value": usd_value,
             "pnl_pct": round(pnl_pct, 2)
         })
