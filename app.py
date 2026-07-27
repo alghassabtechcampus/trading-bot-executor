@@ -162,13 +162,14 @@ def positions():
 
         buy_price = trade["buy_price"]
         buy_value = trade.get("buy_value", 100)
+        buy_time = trade.get("time", 0)
         pnl_pct = ((usd_value - buy_value) / buy_value) * 100
 
         result.append({
             "symbol": symbol,
             "buy_price": buy_price,
             "buy_value": buy_value,
-            "buy_time": trade.get("time", 0),
+            "buy_time": buy_time,
             "usd_value": usd_value,
             "pnl_pct": round(pnl_pct, 2)
         })
@@ -219,7 +220,6 @@ def pnl():
 
     result_list = []
     for symbol, s in summary.items():
-        # فقط الصفقات المكتملة (تم البيع فعلاً)
         if s["sell_value"] < 5:
             continue
         pnl_val = s["sell_value"] - s["buy_value"] - s["fees"]
@@ -295,18 +295,38 @@ def sell():
     if usd_value < 10:
         return jsonify({"error": "Balance too small"}), 400
 
-    # نبيع الكمية ناقص 0.1% عمولة البيع
+    # تحديد طريقة البيع حسب العملة
     if coin in ["BTC", "ETH"]:
-    qty_after_fee = qty_balance * 0.999
-    qty_str = "{:.6f}".format(qty_after_fee)
+        qty_str = "{:.6f}".format(qty_balance * 0.999)
+        body = {
+            "category"   : "spot",
+            "symbol"     : symbol,
+            "side"       : "Sell",
+            "orderType"  : "Market",
+            "qty"        : qty_str,
+            "timeInForce": "IOC",
+        }
     elif coin == "BNB":
-    qty_after_fee = qty_balance * 0.999
-    qty_str = "{:.3f}".format(qty_after_fee)
+        qty_str = "{:.3f}".format(qty_balance * 0.999)
+        body = {
+            "category"   : "spot",
+            "symbol"     : symbol,
+            "side"       : "Sell",
+            "orderType"  : "Market",
+            "qty"        : qty_str,
+            "timeInForce": "IOC",
+        }
     elif coin == "XRP":
-    qty_after_fee = qty_balance * 0.999
-    qty_str = "{:.2f}".format(qty_after_fee)
+        qty_str = "{:.2f}".format(qty_balance * 0.999)
+        body = {
+            "category"   : "spot",
+            "symbol"     : symbol,
+            "side"       : "Sell",
+            "orderType"  : "Market",
+            "qty"        : qty_str,
+            "timeInForce": "IOC",
+        }
     else:
-        # LINK وغيرها نبيع بالقيمة الدولارية ناقص العمولة
         sell_amount = str(round(usd_value * 0.999, 2))
         body = {
             "category"   : "spot",
@@ -317,28 +337,7 @@ def sell():
             "qty"        : sell_amount,
             "timeInForce": "IOC",
         }
-        body_str = json.dumps(body, separators=(",", ":"))
-        headers = post_headers(body)
-        resp = requests.post(BYBIT_BASE_URL + "/v5/order/create", headers=headers, data=body_str, timeout=10)
-        result = resp.json()
-        if result.get("retCode") == 0:
-            trades = load_trades()
-            trades.pop(symbol, None)
-            save_trades(trades)
-        print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": "SELL", "result": result}, ensure_ascii=False))
-        if result.get("retCode") == 0:
-            return jsonify({"status": "sold", "order": result}), 200
-        else:
-            return jsonify({"status": "bybit_error", "detail": result}), 502
 
-    body = {
-        "category"   : "spot",
-        "symbol"     : symbol,
-        "side"       : "Sell",
-        "orderType"  : "Market",
-        "qty"        : qty_str,
-        "timeInForce": "IOC",
-    }
     body_str = json.dumps(body, separators=(',', ':'))
     headers = post_headers(body)
     resp = requests.post(
