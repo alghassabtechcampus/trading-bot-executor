@@ -296,12 +296,15 @@ def sell():
         return jsonify({"error": "Balance too small"}), 400
 
     # نبيع الكمية ناقص 0.1% عمولة البيع
-    if coin in ["BTC", "ETH", "BNB"]:
-        qty_after_fee = qty_balance * 0.999
-        qty_str = "{:.6f}".format(qty_after_fee)
-    elif coin in ["XRP", "BNB"]:
-        qty_after_fee = qty_balance * 0.999
-        qty_str = "{:.2f}".format(qty_after_fee)
+    if coin in ["BTC", "ETH"]:
+    qty_after_fee = qty_balance * 0.999
+    qty_str = "{:.6f}".format(qty_after_fee)
+    elif coin == "BNB":
+    qty_after_fee = qty_balance * 0.999
+    qty_str = "{:.3f}".format(qty_after_fee)
+    elif coin == "XRP":
+    qty_after_fee = qty_balance * 0.999
+    qty_str = "{:.2f}".format(qty_after_fee)
     else:
         # LINK وغيرها نبيع بالقيمة الدولارية ناقص العمولة
         sell_amount = str(round(usd_value * 0.999, 2))
