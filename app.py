@@ -358,6 +358,23 @@ def sell():
         return jsonify({"status": "sold", "order": result}), 200
     else:
         return jsonify({"status": "bybit_error", "detail": result}), 502
-
+@app.route("/usdt_balance", methods=["GET"])
+def usdt_balance():
+    params = {"accountType": "UNIFIED"}
+    headers = get_headers(params)
+    resp = requests.get(
+        BYBIT_BASE_URL + "/v5/account/wallet-balance",
+        headers=headers,
+        params=params,
+        timeout=10
+    )
+    data = resp.json()
+    usdt = 0
+    for c in data["result"]["list"][0]["coin"]:
+        if c["coin"] == "USDT":
+            usdt = float(c["usdValue"])
+            break
+    has_balance = usdt >= 100
+    return jsonify({"usdt": usdt, "has_balance": has_balance}), 200
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
