@@ -294,7 +294,7 @@ def sell():
     if usd_value < 10:
         return jsonify({"error": "Balance too small"}), 400
 
-    # تحديد طريقة البيع حسب العملة
+   # تحديد طريقة البيع حسب العملة
     if coin in ["BTC", "ETH"]:
         qty_str = "{:.6f}".format(qty_balance * 0.999)
         body = {
@@ -315,7 +315,7 @@ def sell():
             "qty"        : qty_str,
             "timeInForce": "IOC",
         }
-    elif coin == "XRP":
+    elif coin in ["XRP", "ADA"]:
         qty_str = "{:.2f}".format(qty_balance * 0.999)
         body = {
             "category"   : "spot",
@@ -325,6 +325,17 @@ def sell():
             "qty"        : qty_str,
             "timeInForce": "IOC",
         }
+    elif coin == "LTC":
+        qty_str = "{:.4f}".format(qty_balance * 0.999)
+        body = {
+            "category"   : "spot",
+            "symbol"     : symbol,
+            "side"       : "Sell",
+            "orderType"  : "Market",
+            "qty"        : qty_str,
+            "timeInForce": "IOC",
+        }
+   
     else:
         sell_amount = str(round(usd_value * 0.999, 2))
         body = {
