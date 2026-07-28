@@ -14,8 +14,7 @@ BYBIT_BASE_URL   = "https://api.bybit.com"
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "my_super_secret_123")
 
 ORIGINAL_COINS = ["BTC", "ETH", "USDC"]
-TRADES_FILE = "/tmp/trades.json"
-
+TRADES_FILE = "/app/trades.json"
 def load_trades():
     try:
         with open(TRADES_FILE, "r") as f:
