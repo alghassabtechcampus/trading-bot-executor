@@ -14,17 +14,6 @@ BYBIT_BASE_URL   = "https://api.bybit.com"
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "my_super_secret_123")
 
 ORIGINAL_COINS = ["BTC", "ETH", "USDC"]
-TRADES_FILE = "/app/trades.json"
-def load_trades():
-    try:
-        with open(TRADES_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_trades(trades):
-    with open(TRADES_FILE, "w") as f:
-        json.dump(trades, f)
 
 def sign(pre_sign: str) -> str:
     return hmac.new(
@@ -58,24 +47,33 @@ def verify_webhook(req) -> bool:
     sig = req.headers.get("X-Webhook-Signature", "")
     return sig == WEBHOOK_SECRET
 
-def place_order(symbol, side, qty, stop_loss, take_profit):
-    body = {
-        "category"   : "spot",
-        "symbol"     : symbol,
-        "side"       : side,
-        "orderType"  : "Market",
-        "qty"        : str(qty),
-        "timeInForce": "IOC",
+def get_last_buy_price(symbol: str) -> dict:
+    """جلب آخر سعر شراء للعملة من Bybit مباشرة"""
+    params = {
+        "category": "spot",
+        "symbol": symbol,
+        "limit": "10"
     }
-    body_str = json.dumps(body, separators=(',', ':'))
-    headers = post_headers(body)
-    resp = requests.post(
-        BYBIT_BASE_URL + "/v5/order/create",
+    headers = get_headers(params)
+    resp = requests.get(
+        BYBIT_BASE_URL + "/v5/order/history",
         headers=headers,
-        data=body_str,
+        params=params,
         timeout=10
     )
-    return resp.json()
+    data = resp.json()
+    if data.get("retCode") != 0:
+        return {}
+    
+    orders = data.get("result", {}).get("list", [])
+    for order in orders:
+        if order.get("side") == "Buy" and order.get("orderStatus") == "Filled":
+            return {
+                "buy_price": float(order.get("avgPrice", 0)),
+                "buy_value": float(order.get("cumExecValue", 100)),
+                "buy_time": int(order.get("updatedTime", 0)) // 1000
+            }
+    return {}
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -96,23 +94,29 @@ def execute():
     stop_loss   = data["stopLoss"]
     take_profit = data["takeProfit"]
     qty         = data["qty"]
-    price       = float(data["price"])
 
     if action not in ("BUY", "SELL"):
         return jsonify({"error": "action must be BUY or SELL"}), 400
 
     side = "Buy" if action == "BUY" else "Sell"
-    result = place_order(symbol, side, qty, stop_loss, take_profit)
-
-    if result.get("retCode") == 0 and action == "BUY":
-        trades = load_trades()
-        trades[symbol] = {
-            "buy_price": price,
-            "buy_value": 100,
-            "qty": qty,
-            "time": int(time.time())
-        }
-        save_trades(trades)
+    
+    body = {
+        "category"   : "spot",
+        "symbol"     : symbol,
+        "side"       : side,
+        "orderType"  : "Market",
+        "qty"        : str(qty),
+        "timeInForce": "IOC",
+    }
+    body_str = json.dumps(body, separators=(',', ':'))
+    headers = post_headers(body)
+    resp = requests.post(
+        BYBIT_BASE_URL + "/v5/order/create",
+        headers=headers,
+        data=body_str,
+        timeout=10
+    )
+    result = resp.json()
 
     print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": action, "result": result}, ensure_ascii=False))
 
@@ -135,8 +139,7 @@ def balance():
 
 @app.route("/positions", methods=["GET"])
 def positions():
-    trades = load_trades()
-
+    """يجلب المواقف المفتوحة من Bybit مباشرة بدون ذاكرة"""
     params = {"accountType": "UNIFIED"}
     headers = get_headers(params)
     resp = requests.get(
@@ -147,21 +150,31 @@ def positions():
     )
     balance_data = resp.json()
 
+    watch_list = ["BNB", "LINK", "XRP", "ADA", "LTC"]
     result = []
-    for symbol, trade in trades.items():
-        coin = symbol.replace("USDT", "")
-        usd_value = 0
-        for c in balance_data["result"]["list"][0]["coin"]:
-            if c["coin"] == coin:
-                usd_value = float(c["usdValue"])
-                break
 
+    for c in balance_data["result"]["list"][0]["coin"]:
+        coin = c["coin"]
+        if coin not in watch_list:
+            continue
+        
+        usd_value = float(c["usdValue"])
         if usd_value < 5:
             continue
 
-        buy_price = trade["buy_price"]
-        buy_value = trade.get("buy_value", 100)
-        buy_time = trade.get("time", 0)
+        symbol = coin + "USDT"
+        trade_info = get_last_buy_price(symbol)
+        
+        if not trade_info:
+            continue
+
+        buy_price = trade_info.get("buy_price", 0)
+        buy_value = trade_info.get("buy_value", 100)
+        buy_time = trade_info.get("buy_time", 0)
+
+        if buy_value <= 0:
+            continue
+
         pnl_pct = ((usd_value - buy_value) / buy_value) * 100
 
         result.append({
@@ -242,24 +255,41 @@ def check_position():
     if coin in ORIGINAL_COINS:
         return jsonify({"has_position": False}), 200
 
-    trades = load_trades()
-    if symbol in trades:
-        params = {"accountType": "UNIFIED"}
-        headers = get_headers(params)
-        resp = requests.get(
-            BYBIT_BASE_URL + "/v5/account/wallet-balance",
-            headers=headers,
-            params=params,
-            timeout=10
-        )
-        data = resp.json()
-        for c in data["result"]["list"][0]["coin"]:
-            if c["coin"] == coin:
-                usd_value = float(c["usdValue"])
-                if usd_value > 5:
-                    return jsonify({"has_position": True, "usd_value": usd_value}), 200
+    params = {"accountType": "UNIFIED"}
+    headers = get_headers(params)
+    resp = requests.get(
+        BYBIT_BASE_URL + "/v5/account/wallet-balance",
+        headers=headers,
+        params=params,
+        timeout=10
+    )
+    data = resp.json()
+    for c in data["result"]["list"][0]["coin"]:
+        if c["coin"] == coin:
+            usd_value = float(c["usdValue"])
+            if usd_value > 5:
+                return jsonify({"has_position": True, "usd_value": usd_value}), 200
 
     return jsonify({"has_position": False}), 200
+
+@app.route("/usdt_balance", methods=["GET"])
+def usdt_balance():
+    params = {"accountType": "UNIFIED"}
+    headers = get_headers(params)
+    resp = requests.get(
+        BYBIT_BASE_URL + "/v5/account/wallet-balance",
+        headers=headers,
+        params=params,
+        timeout=10
+    )
+    data = resp.json()
+    usdt = 0
+    for c in data["result"]["list"][0]["coin"]:
+        if c["coin"] == "USDT":
+            usdt = float(c["usdValue"])
+            break
+    has_balance = usdt >= 100
+    return jsonify({"usdt": usdt, "has_balance": has_balance}), 200
 
 @app.route("/sell", methods=["POST"])
 def sell():
@@ -294,7 +324,6 @@ def sell():
     if usd_value < 10:
         return jsonify({"error": "Balance too small"}), 400
 
-   # تحديد طريقة البيع حسب العملة
     if coin in ["BTC", "ETH"]:
         qty_str = "{:.6f}".format(qty_balance * 0.999)
         body = {
@@ -335,7 +364,6 @@ def sell():
             "qty"        : qty_str,
             "timeInForce": "IOC",
         }
-   
     else:
         sell_amount = str(round(usd_value * 0.999, 2))
         body = {
@@ -358,34 +386,12 @@ def sell():
     )
     result = resp.json()
 
-    if result.get("retCode") == 0:
-        trades = load_trades()
-        trades.pop(symbol, None)
-        save_trades(trades)
-
     print(json.dumps({"time": int(time.time()), "symbol": symbol, "action": "SELL", "result": result}, ensure_ascii=False))
 
     if result.get("retCode") == 0:
         return jsonify({"status": "sold", "order": result}), 200
     else:
         return jsonify({"status": "bybit_error", "detail": result}), 502
-@app.route("/usdt_balance", methods=["GET"])
-def usdt_balance():
-    params = {"accountType": "UNIFIED"}
-    headers = get_headers(params)
-    resp = requests.get(
-        BYBIT_BASE_URL + "/v5/account/wallet-balance",
-        headers=headers,
-        params=params,
-        timeout=10
-    )
-    data = resp.json()
-    usdt = 0
-    for c in data["result"]["list"][0]["coin"]:
-        if c["coin"] == "USDT":
-            usdt = float(c["usdValue"])
-            break
-    has_balance = usdt >= 100
-    return jsonify({"usdt": usdt, "has_balance": has_balance}), 200
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
