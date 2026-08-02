@@ -175,9 +175,15 @@ def execute():
                         headers=post_headers(body), data=body_str, timeout=10)
     result = resp.json()
     if result.get("retCode") == 0 and action == "BUY":
-        redis_set(f"trade:{symbol}", {
-            "buy_price": price, "buy_value": 100, "time": int(time.time())
-        })
+    redis_set(f"trade:{symbol}", {
+        "buy_price": price,
+        "buy_value": 100,
+        "time": int(time.time())
+    })
+    # حفظ signal_id لمنع التكرار
+    signal_id = data.get("signal_id", "")
+    if signal_id:
+        redis_set(f"signal:{signal_id}", {"time": int(time.time())})
     print(json.dumps({"time": int(time.time()), "symbol": symbol, 
                       "action": action, "result": result}, ensure_ascii=False))
     if result.get("retCode") == 0:
@@ -265,6 +271,14 @@ def pnl():
             "sell_value": round(v["sell_value"], 4),
         })
     return jsonify({"result": result_list}), 200
+
+@app.route("/check_signal", methods=["GET"])
+def check_signal():
+    signal_id = request.args.get("signal_id", "")
+    if not signal_id:
+        return jsonify({"exists": False}), 200
+    result = redis_get(f"signal:{signal_id}")
+    return jsonify({"exists": bool(result)}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
