@@ -1,6 +1,6 @@
-from urllib.parse import urlencode
 from __future__ import annotations
 
+from urllib.parse import urlencode
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from functools import wraps
 from typing import Any
