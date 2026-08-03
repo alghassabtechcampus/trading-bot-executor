@@ -1,3 +1,4 @@
+from urllib.parse import urlencode
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
@@ -201,13 +202,13 @@ def base_headers(timestamp: str, signature: str) -> dict[str, str]:
 
 def get_headers(params: dict[str, Any]) -> dict[str, str]:
     timestamp = now_ms()
-    query = "&".join(
-        f"{key}={value}"
-        for key, value in sorted(params.items())
-    )
-    signature = sign(f"{timestamp}{BYBIT_API_KEY}5000{query}")
-    return base_headers(timestamp, signature)
+    query = urlencode(params)
 
+    signature = sign(
+        f"{timestamp}{BYBIT_API_KEY}5000{query}"
+    )
+
+    return base_headers(timestamp, signature)
 
 def post_headers(body: dict[str, Any]) -> dict[str, str]:
     timestamp = now_ms()
