@@ -675,6 +675,7 @@ def execute():
         "takeProfit",
         "qty",
         "signal_id",
+        "trade_id",
     }
     missing = sorted(required.difference(data))
 
