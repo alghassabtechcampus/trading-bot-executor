@@ -575,6 +575,7 @@ def close_tracked_trade(
 
     return {
         "status": "sold",
+        "trade_id": trade.get("trade_id"),
         "symbol": symbol,
         "reason": reason,
         "order": response,
@@ -689,6 +690,7 @@ def execute():
         symbol = str(data["symbol"]).upper().strip()
         action = str(data["action"]).upper().strip()
         signal_id = str(data["signal_id"]).strip()
+        trade_id = str(data["trade_id"]).strip()
 
         analysis_price = as_decimal(data["price"], "price")
         stop_loss = as_decimal(data["stopLoss"], "stopLoss")
@@ -702,6 +704,8 @@ def execute():
 
         if not signal_id:
             raise ValueError("signal_id is required")
+        if not trade_id:
+            raise ValueError("trade_id is required")   
 
         if analysis_price <= 0 or quote_amount <= 0:
             raise ValueError("price and qty must be positive")
@@ -774,6 +778,7 @@ def execute():
         details = execution_details(order)
 
         trade = {
+            "trade_id": trade_id,
             "symbol": symbol,
             "coin": coin_from_symbol(symbol),
             "signal_id": signal_id,
