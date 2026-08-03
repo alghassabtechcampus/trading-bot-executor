@@ -292,20 +292,25 @@ def wallet_coins() -> list[dict[str, Any]]:
 def get_coin_balance(coin: str) -> dict[str, Decimal]:
     for item in wallet_coins():
         if item.get("coin") == coin:
+            wallet_value = item.get("walletBalance") or "0"
+            available_value = (
+                item.get("availableToWithdraw")
+                or item.get("walletBalance")
+                or "0"
+            )
+            usd_value = item.get("usdValue") or "0"
+
             return {
                 "wallet_balance": as_decimal(
-                    item.get("walletBalance", "0"),
+                    wallet_value,
                     "walletBalance",
                 ),
                 "available": as_decimal(
-                    item.get(
-                        "availableToWithdraw",
-                        item.get("walletBalance", "0"),
-                    ),
+                    available_value,
                     "available",
                 ),
                 "usd_value": as_decimal(
-                    item.get("usdValue", "0"),
+                    usd_value,
                     "usdValue",
                 ),
             }
