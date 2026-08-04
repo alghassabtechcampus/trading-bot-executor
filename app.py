@@ -13,6 +13,8 @@ import time
 
 import requests
 from flask import Flask, jsonify, request
+from dotenv import load_dotenv
+load_dotenv('.env')
 
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
