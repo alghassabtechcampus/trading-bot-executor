@@ -37,6 +37,7 @@ MIN_BALANCE_BUFFER = Decimal(os.getenv("MIN_BALANCE_BUFFER", "1.01"))
 MIN_POSITION_USD = Decimal(os.getenv("MIN_POSITION_USD", "5"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 SIGNAL_LOCK_SECONDS = int(os.getenv("SIGNAL_LOCK_SECONDS", "86400"))
+MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "60"))
 
 # العملات الموجودة قبل تشغيل البوت والتي لا نريد بيع رصيدها القديم.
 # البوت سيبيع فقط executed_qty المخزنة للصفقة، لذلك القائمة للحماية الإضافية.
@@ -887,6 +888,7 @@ def monitor_positions():
             current_price = get_ticker_price(symbol)
             stop_loss = as_decimal(trade["stop_loss"], "stop_loss")
             take_profit = as_decimal(trade["take_profit"], "take_profit")
+            hold_minutes = (time.time() - int(trade["time"])) / 60
 
             if current_price <= stop_loss:
                 sale = close_tracked_trade(symbol, "stop_loss")
@@ -903,6 +905,16 @@ def monitor_positions():
                     "symbol": symbol,
                     "trigger": "take_profit",
                     "price": decimal_str(current_price),
+                    "result": sale,
+                })
+
+            elif hold_minutes >= MAX_HOLD_MINUTES:
+                sale = close_tracked_trade(symbol, "max_hold_time")
+                results.append({
+                    "symbol": symbol,
+                    "trigger": "max_hold_time",
+                    "price": decimal_str(current_price),
+                    "hold_minutes": round(hold_minutes, 1),
                     "result": sale,
                 })
 
