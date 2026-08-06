@@ -542,7 +542,20 @@ def close_tracked_trade(
         "executed_qty",
     )
     coin = coin_from_symbol(symbol)
-    wallet_qty = get_coin_balance(coin)["wallet_balance"]
+    coin_balance = get_coin_balance(coin)
+    wallet_qty = coin_balance["wallet_balance"]
+
+    # رصيد أقل من الحد الأدنى القابل للتداول = غبار متبقي من بيع سابق
+    # (يدوي أو خارج مسار البوت) — لا داعي لمحاولة بيعه، فقط ننظّف السجل.
+    if coin_balance["usd_value"] < MIN_POSITION_USD:
+        redis_delete(trade_key(symbol))
+        return {
+            "status": "dust_cleared",
+            "symbol": symbol,
+            "reason": reason,
+            "wallet_qty": decimal_str(wallet_qty),
+            "usd_value": decimal_str(coin_balance["usd_value"]),
+        }
 
     # نبيع فقط الأقل بين كمية الصفقة المسجلة والرصيد المتاح.
     quantity = min(requested_qty, wallet_qty) * Decimal("0.999")
@@ -639,9 +652,10 @@ def check_position():
         "executed_qty",
     )
     coin = coin_from_symbol(symbol)
-    wallet_qty = get_coin_balance(coin)["wallet_balance"]
+    coin_balance = get_coin_balance(coin)
+    wallet_qty = coin_balance["wallet_balance"]
 
-    if executed_qty > 0 and wallet_qty > 0:
+    if executed_qty > 0 and wallet_qty > 0 and coin_balance["usd_value"] >= MIN_POSITION_USD:
         return jsonify({
             "has_position": True,
             "trade": trade,
