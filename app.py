@@ -37,7 +37,7 @@ MIN_BALANCE_BUFFER = Decimal(os.getenv("MIN_BALANCE_BUFFER", "1.01"))
 MIN_POSITION_USD = Decimal(os.getenv("MIN_POSITION_USD", "5"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 SIGNAL_LOCK_SECONDS = int(os.getenv("SIGNAL_LOCK_SECONDS", "86400"))
-MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "60"))
+MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "90"))
 
 # العملات الموجودة قبل تشغيل البوت والتي لا نريد بيع رصيدها القديم.
 # البوت سيبيع فقط executed_qty المخزنة للصفقة، لذلك القائمة للحماية الإضافية.
