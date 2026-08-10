@@ -38,6 +38,7 @@ class ConfigurationTests(unittest.TestCase):
         )
         manifest = config.manifest_values()
         self.assertEqual(manifest["execution_profile"], "CUSTOM")
+        self.assertEqual(manifest["end_of_test_policy"], "CLOSE_AT_END")
         self.assertEqual(manifest["financial_assumptions"]["entry_fee_rate"], "0.001")
         self.assertEqual(manifest["financial_assumptions"]["spread_bps"], "4")
 

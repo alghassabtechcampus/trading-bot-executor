@@ -1,6 +1,12 @@
-"""Backtest Engine V2 core package (Phases 1 through 3)."""
+"""Backtest Engine V2 core package (Phases 1 through 5)."""
 
-from .config import ExecutionProfile, FinancialAssumptions, IntrabarPolicy, RunConfig
+from .config import (
+    EndOfTestPolicy,
+    ExecutionProfile,
+    FinancialAssumptions,
+    IntrabarPolicy,
+    RunConfig,
+)
 from .models import (
     Candle,
     ClosedTrade,
@@ -14,6 +20,7 @@ from .models import (
     SignalIntent,
     SignalSide,
 )
+from .portfolio import EquityEventType, EquityPoint, PortfolioState, Position
 
 __all__ = [
     "Candle",
@@ -22,11 +29,16 @@ __all__ = [
     "ExecutionReason",
     "ExecutionResult",
     "ExitReason",
+    "EndOfTestPolicy",
+    "EquityEventType",
+    "EquityPoint",
     "Fill",
     "FinancialAssumptions",
     "IntrabarPolicy",
     "PendingOrder",
     "PendingOrderStatus",
+    "PortfolioState",
+    "Position",
     "RejectionReason",
     "RunConfig",
     "SignalIntent",

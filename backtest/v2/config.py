@@ -28,6 +28,11 @@ class IntrabarPolicy(str, Enum):
     TAKE_PROFIT_FIRST = "TAKE_PROFIT_FIRST"
 
 
+class EndOfTestPolicy(str, Enum):
+    CLOSE_AT_END = "CLOSE_AT_END"
+    KEEP_MARKED = "KEEP_MARKED"
+
+
 def _require_decimal(name: str, value: Decimal) -> None:
     if not isinstance(value, Decimal):
         raise ConfigurationError(f"{name} must be Decimal, not {type(value).__name__}")
@@ -83,12 +88,15 @@ class RunConfig:
     base_currency: str
     max_concurrent_positions: int
     intrabar_policy: IntrabarPolicy = IntrabarPolicy.STOP_FIRST
+    end_of_test_policy: EndOfTestPolicy = EndOfTestPolicy.CLOSE_AT_END
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution_profile, ExecutionProfile):
             raise ConfigurationError("execution_profile must be an ExecutionProfile")
         if not isinstance(self.intrabar_policy, IntrabarPolicy):
             raise ConfigurationError("intrabar_policy must be an IntrabarPolicy")
+        if not isinstance(self.end_of_test_policy, EndOfTestPolicy):
+            raise ConfigurationError("end_of_test_policy must be an EndOfTestPolicy")
         _require_decimal("initial_capital", self.initial_capital)
         if self.initial_capital <= 0:
             raise ConfigurationError("initial_capital must be positive")
@@ -103,6 +111,7 @@ class RunConfig:
         values = asdict(self)
         values["execution_profile"] = self.execution_profile.value
         values["intrabar_policy"] = self.intrabar_policy.value
+        values["end_of_test_policy"] = self.end_of_test_policy.value
         values["initial_capital"] = str(self.initial_capital)
         values["financial_assumptions"] = {
             key: str(value) for key, value in values["financial_assumptions"].items()
