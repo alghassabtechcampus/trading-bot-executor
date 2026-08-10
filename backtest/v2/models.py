@@ -26,6 +26,7 @@ class RejectionReason(str, Enum):
     INVALID_SIZE = "INVALID_SIZE"
     STALE_SIGNAL = "STALE_SIGNAL"
     INVALID_STOP = "INVALID_STOP"
+    MISSING_STOP = "MISSING_STOP"
 
 
 class SignalSide(str, Enum):

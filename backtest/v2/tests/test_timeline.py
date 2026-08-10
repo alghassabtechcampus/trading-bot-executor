@@ -186,6 +186,7 @@ class ArchitectureCompletenessTests(unittest.TestCase):
                 "INVALID_SIZE",
                 "STALE_SIGNAL",
                 "INVALID_STOP",
+                "MISSING_STOP",
             },
         )
 

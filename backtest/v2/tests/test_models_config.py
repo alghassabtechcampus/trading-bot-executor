@@ -8,6 +8,7 @@ from backtest.v2.config import (
     ConfigurationError,
     ExecutionProfile,
     FinancialAssumptions,
+    PositionSizingMode,
     RunConfig,
 )
 from backtest.v2.models import ClosedTrade, ExitReason
@@ -35,12 +36,17 @@ class ConfigurationTests(unittest.TestCase):
             initial_capital=Decimal("10000"),
             base_currency="USDT",
             max_concurrent_positions=2,
+            position_sizing_mode=PositionSizingMode.FIXED_NOTIONAL,
+            fixed_notional=Decimal("100"),
+            risk_per_trade=None,
         )
         manifest = config.manifest_values()
         self.assertEqual(manifest["execution_profile"], "CUSTOM")
         self.assertEqual(manifest["end_of_test_policy"], "CLOSE_AT_END")
         self.assertEqual(manifest["financial_assumptions"]["entry_fee_rate"], "0.001")
         self.assertEqual(manifest["financial_assumptions"]["spread_bps"], "4")
+        self.assertEqual(manifest["position_sizing_mode"], "FIXED_NOTIONAL")
+        self.assertEqual(manifest["fixed_notional"], "100")
 
     def test_rejects_float_to_prevent_unit_ambiguity(self):
         with self.assertRaises(ConfigurationError):
@@ -54,9 +60,33 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_requires_positive_capital_and_concurrency(self):
         with self.assertRaises(ConfigurationError):
-            RunConfig(ExecutionProfile.CUSTOM, assumptions(), Decimal("0"), "USDT", 1)
+            RunConfig(
+                ExecutionProfile.CUSTOM, assumptions(), Decimal("0"), "USDT", 1,
+                PositionSizingMode.FIXED_NOTIONAL, Decimal("100"), None,
+            )
         with self.assertRaises(ConfigurationError):
-            RunConfig(ExecutionProfile.CUSTOM, assumptions(), Decimal("100"), "USDT", 0)
+            RunConfig(
+                ExecutionProfile.CUSTOM, assumptions(), Decimal("100"), "USDT", 0,
+                PositionSizingMode.FIXED_NOTIONAL, Decimal("100"), None,
+            )
+
+    def test_sizing_configuration_is_explicit_and_unit_safe(self):
+        for invalid in (Decimal("0"), Decimal("-1")):
+            with self.subTest(fixed_notional=invalid), self.assertRaises(ConfigurationError):
+                RunConfig(
+                    ExecutionProfile.CUSTOM, assumptions(), Decimal("100"), "USDT", 1,
+                    PositionSizingMode.FIXED_NOTIONAL, invalid, None,
+                )
+            with self.subTest(risk_per_trade=invalid), self.assertRaises(ConfigurationError):
+                RunConfig(
+                    ExecutionProfile.CUSTOM, assumptions(), Decimal("100"), "USDT", 1,
+                    PositionSizingMode.RISK_PERCENT, None, invalid,
+                )
+        with self.assertRaises(ConfigurationError):
+            RunConfig(
+                ExecutionProfile.CUSTOM, assumptions(), Decimal("100"), "USDT", 1,
+                PositionSizingMode.RISK_PERCENT, None, 0.01,
+            )
 
 
 class ClosedTradeTests(unittest.TestCase):

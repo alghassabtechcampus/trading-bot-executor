@@ -33,6 +33,11 @@ class EndOfTestPolicy(str, Enum):
     KEEP_MARKED = "KEEP_MARKED"
 
 
+class PositionSizingMode(str, Enum):
+    FIXED_NOTIONAL = "FIXED_NOTIONAL"
+    RISK_PERCENT = "RISK_PERCENT"
+
+
 def _require_decimal(name: str, value: Decimal) -> None:
     if not isinstance(value, Decimal):
         raise ConfigurationError(f"{name} must be Decimal, not {type(value).__name__}")
@@ -87,6 +92,9 @@ class RunConfig:
     initial_capital: Decimal
     base_currency: str
     max_concurrent_positions: int
+    position_sizing_mode: PositionSizingMode
+    fixed_notional: Decimal | None
+    risk_per_trade: Decimal | None
     intrabar_policy: IntrabarPolicy = IntrabarPolicy.STOP_FIRST
     end_of_test_policy: EndOfTestPolicy = EndOfTestPolicy.CLOSE_AT_END
 
@@ -97,6 +105,8 @@ class RunConfig:
             raise ConfigurationError("intrabar_policy must be an IntrabarPolicy")
         if not isinstance(self.end_of_test_policy, EndOfTestPolicy):
             raise ConfigurationError("end_of_test_policy must be an EndOfTestPolicy")
+        if not isinstance(self.position_sizing_mode, PositionSizingMode):
+            raise ConfigurationError("position_sizing_mode must be a PositionSizingMode")
         _require_decimal("initial_capital", self.initial_capital)
         if self.initial_capital <= 0:
             raise ConfigurationError("initial_capital must be positive")
@@ -104,6 +114,22 @@ class RunConfig:
             raise ConfigurationError("base_currency must be non-empty")
         if isinstance(self.max_concurrent_positions, bool) or self.max_concurrent_positions < 1:
             raise ConfigurationError("max_concurrent_positions must be a positive integer")
+        if self.position_sizing_mode is PositionSizingMode.FIXED_NOTIONAL:
+            if self.fixed_notional is None:
+                raise ConfigurationError("fixed_notional is required for FIXED_NOTIONAL")
+            _require_decimal("fixed_notional", self.fixed_notional)
+            if self.fixed_notional <= 0:
+                raise ConfigurationError("fixed_notional must be positive")
+            if self.risk_per_trade is not None:
+                raise ConfigurationError("risk_per_trade must be None for FIXED_NOTIONAL")
+        else:
+            if self.risk_per_trade is None:
+                raise ConfigurationError("risk_per_trade is required for RISK_PERCENT")
+            _require_decimal("risk_per_trade", self.risk_per_trade)
+            if self.risk_per_trade <= 0 or self.risk_per_trade >= 1:
+                raise ConfigurationError("risk_per_trade must be a decimal rate in (0, 1)")
+            if self.fixed_notional is not None:
+                raise ConfigurationError("fixed_notional must be None for RISK_PERCENT")
 
     def manifest_values(self) -> dict[str, Any]:
         """Return JSON-friendly values, preserving explicit units in keys."""
@@ -112,7 +138,14 @@ class RunConfig:
         values["execution_profile"] = self.execution_profile.value
         values["intrabar_policy"] = self.intrabar_policy.value
         values["end_of_test_policy"] = self.end_of_test_policy.value
+        values["position_sizing_mode"] = self.position_sizing_mode.value
         values["initial_capital"] = str(self.initial_capital)
+        values["fixed_notional"] = (
+            None if self.fixed_notional is None else str(self.fixed_notional)
+        )
+        values["risk_per_trade"] = (
+            None if self.risk_per_trade is None else str(self.risk_per_trade)
+        )
         values["financial_assumptions"] = {
             key: str(value) for key, value in values["financial_assumptions"].items()
         }
