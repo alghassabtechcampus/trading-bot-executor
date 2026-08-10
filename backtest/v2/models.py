@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+from types import MappingProxyType
+from typing import Any, Mapping
 
 
 class ExitReason(str, Enum):
@@ -29,6 +31,129 @@ class RejectionReason(str, Enum):
 class SignalSide(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
+
+
+class PendingOrderStatus(str, Enum):
+    PENDING = "PENDING"
+    FILLED = "FILLED"
+    REJECTED = "REJECTED"
+    CANCELLED = "CANCELLED"
+
+
+class ExecutionReason(str, Enum):
+    ENTRY_MARKET = "ENTRY_MARKET"
+    EXIT_MARKET = "EXIT_MARKET"
+    STOP_LOSS = "STOP_LOSS"
+    TAKE_PROFIT = "TAKE_PROFIT"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingOrder:
+    """A causal order intent that cannot execute before ``eligible_from``."""
+
+    order_id: str
+    symbol: str
+    side: SignalSide
+    signal_time: datetime
+    eligible_from: datetime
+    strategy_name: str
+    strategy_version: str
+    reference_price: Decimal
+    stop_loss: Decimal | None
+    take_profit: Decimal | None
+    score: Decimal | None
+    priority: int | None
+    metadata: Mapping[str, Any]
+    status: PendingOrderStatus
+    quantity: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if not self.order_id or not self.symbol or not self.strategy_name or not self.strategy_version:
+            raise ValueError("order_id, symbol, strategy_name, and strategy_version are required")
+        for name, value in (("signal_time", self.signal_time), ("eligible_from", self.eligible_from)):
+            if value.tzinfo is None or value.utcoffset() != timedelta(0):
+                raise ValueError(f"{name} must be timezone-aware UTC")
+        if self.eligible_from <= self.signal_time:
+            raise ValueError("eligible_from must be later than signal_time")
+        if not isinstance(self.side, SignalSide):
+            raise ValueError("side must be a SignalSide")
+        if not isinstance(self.status, PendingOrderStatus):
+            raise ValueError("status must be a PendingOrderStatus")
+        for name in ("reference_price", "stop_loss", "take_profit", "score", "quantity"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, Decimal) or not value.is_finite()
+            ):
+                raise ValueError(f"{name} must be a finite Decimal or None")
+        if self.reference_price <= 0:
+            raise ValueError("reference_price must be positive")
+        if self.stop_loss is not None and self.stop_loss <= 0:
+            raise ValueError("stop_loss must be positive when supplied")
+        if self.take_profit is not None and self.take_profit <= 0:
+            raise ValueError("take_profit must be positive when supplied")
+        if self.quantity is not None and self.quantity <= 0:
+            raise ValueError("quantity must be positive when supplied")
+        if self.priority is not None and (
+            isinstance(self.priority, bool) or not isinstance(self.priority, int)
+        ):
+            raise ValueError("priority must be an integer or None")
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+
+
+@dataclass(frozen=True, slots=True)
+class Fill:
+    """One costed execution result; monetary costs use quote currency."""
+
+    order_id: str
+    symbol: str
+    side: SignalSide
+    timestamp: datetime
+    reference_price: Decimal
+    fill_price: Decimal
+    quantity: Decimal
+    notional: Decimal
+    spread_cost: Decimal
+    slippage_cost: Decimal
+    fee: Decimal
+    execution_reason: ExecutionReason
+
+    def __post_init__(self) -> None:
+        if not self.order_id or not self.symbol:
+            raise ValueError("order_id and symbol are required")
+        if self.timestamp.tzinfo is None or self.timestamp.utcoffset() != timedelta(0):
+            raise ValueError("timestamp must be timezone-aware UTC")
+        if not isinstance(self.side, SignalSide):
+            raise ValueError("side must be a SignalSide")
+        if not isinstance(self.execution_reason, ExecutionReason):
+            raise ValueError("execution_reason must be an ExecutionReason")
+        positive = ("reference_price", "fill_price", "quantity", "notional")
+        non_negative = ("spread_cost", "slippage_cost", "fee")
+        for name in positive:
+            value = getattr(self, name)
+            if not isinstance(value, Decimal) or not value.is_finite() or value <= 0:
+                raise ValueError(f"{name} must be a positive finite Decimal")
+        for name in non_negative:
+            value = getattr(self, name)
+            if not isinstance(value, Decimal) or not value.is_finite() or value < 0:
+                raise ValueError(f"{name} must be a non-negative finite Decimal")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRejection:
+    order_id: str
+    symbol: str
+    timestamp: datetime
+    reason: RejectionReason
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionResult:
+    fill: Fill | None = None
+    rejection: ExecutionRejection | None = None
+
+    def __post_init__(self) -> None:
+        if (self.fill is None) == (self.rejection is None):
+            raise ValueError("exactly one of fill or rejection must be supplied")
 
 
 @dataclass(frozen=True, slots=True)

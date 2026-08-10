@@ -23,6 +23,11 @@ class ExecutionProfile(str, Enum):
     CUSTOM = "CUSTOM"
 
 
+class IntrabarPolicy(str, Enum):
+    STOP_FIRST = "STOP_FIRST"
+    TAKE_PROFIT_FIRST = "TAKE_PROFIT_FIRST"
+
+
 def _require_decimal(name: str, value: Decimal) -> None:
     if not isinstance(value, Decimal):
         raise ConfigurationError(f"{name} must be Decimal, not {type(value).__name__}")
@@ -77,10 +82,13 @@ class RunConfig:
     initial_capital: Decimal
     base_currency: str
     max_concurrent_positions: int
+    intrabar_policy: IntrabarPolicy = IntrabarPolicy.STOP_FIRST
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution_profile, ExecutionProfile):
             raise ConfigurationError("execution_profile must be an ExecutionProfile")
+        if not isinstance(self.intrabar_policy, IntrabarPolicy):
+            raise ConfigurationError("intrabar_policy must be an IntrabarPolicy")
         _require_decimal("initial_capital", self.initial_capital)
         if self.initial_capital <= 0:
             raise ConfigurationError("initial_capital must be positive")
@@ -94,6 +102,7 @@ class RunConfig:
 
         values = asdict(self)
         values["execution_profile"] = self.execution_profile.value
+        values["intrabar_policy"] = self.intrabar_policy.value
         values["initial_capital"] = str(self.initial_capital)
         values["financial_assumptions"] = {
             key: str(value) for key, value in values["financial_assumptions"].items()
