@@ -1,1 +1,36 @@
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Virtual environments
+venv/
+.venv/
+
+# Python caches
+**pycache**/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+
+# Generated market data
+backtest/data/
+
+# Generated backtest outputs
+backtest/results/
+backtest/*.log
+backtest/v2/runs/
+
+# Local assistant/tool config
+.claude/
