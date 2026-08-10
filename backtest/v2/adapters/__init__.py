@@ -1,0 +1,6 @@
+"""Strategy adapters supported by Backtest V2."""
+
+from .base import AdapterSignal, StrategyAdapter
+from .version_ab import VersionAAdapter
+
+__all__ = ["AdapterSignal", "StrategyAdapter", "VersionAAdapter"]

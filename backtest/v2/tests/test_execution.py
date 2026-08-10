@@ -86,9 +86,13 @@ def bar(
 
 
 class PendingOrderTests(unittest.TestCase):
-    def test_eligible_from_must_be_later_than_signal_time(self):
+    def test_eligible_from_cannot_precede_signal_time(self):
         with self.assertRaises(ValueError):
-            order(eligible_from=SIGNAL_TIME)
+            order(eligible_from=SIGNAL_TIME - TF)
+
+    def test_close_to_next_open_boundary_may_share_timestamp(self):
+        pending = order(eligible_from=SIGNAL_TIME)
+        self.assertEqual(pending.eligible_from, pending.signal_time)
 
     def test_pending_metadata_is_read_only(self):
         pending = order()

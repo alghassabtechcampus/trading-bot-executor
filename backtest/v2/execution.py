@@ -76,8 +76,8 @@ def execute_pending_entry(
         return _entry_rejection(order, RejectionReason.NO_NEXT_BAR)
 
     next_candle = eligible[0]
-    if next_candle.timestamp <= order.signal_time:
-        raise CausalExecutionError("entry fill must be later than signal_time")
+    if next_candle.timestamp < order.signal_time:
+        raise CausalExecutionError("entry fill cannot precede signal_time")
     costed = buy_costed_price(next_candle.open, order.quantity, assumptions)
     notional = costed.fill_price * order.quantity
     fill = Fill(

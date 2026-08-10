@@ -74,8 +74,8 @@ class PendingOrder:
         for name, value in (("signal_time", self.signal_time), ("eligible_from", self.eligible_from)):
             if value.tzinfo is None or value.utcoffset() != timedelta(0):
                 raise ValueError(f"{name} must be timezone-aware UTC")
-        if self.eligible_from <= self.signal_time:
-            raise ValueError("eligible_from must be later than signal_time")
+        if self.eligible_from < self.signal_time:
+            raise ValueError("eligible_from cannot precede signal_time")
         if not isinstance(self.side, SignalSide):
             raise ValueError("side must be a SignalSide")
         if not isinstance(self.status, PendingOrderStatus):
