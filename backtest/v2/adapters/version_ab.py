@@ -21,9 +21,10 @@ class VersionAAdapter:
     strategy_version = "legacy-strategy-a"
     max_hold_minutes = 90
     window_size = 200
+    requires_btc_context = False
 
     @staticmethod
-    def _legacy_window(history: Sequence[Candle]) -> list[dict[str, float | int]]:
+    def _legacy_candles(history: Sequence[Candle]) -> list[dict[str, float | int]]:
         return [
             {
                 "timestamp": int(candle.timestamp.timestamp() * 1000),
@@ -33,10 +34,20 @@ class VersionAAdapter:
                 "close": float(candle.close),
                 "volume": float(candle.volume),
             }
-            for candle in history[-VersionAAdapter.window_size:]
+            for candle in history
         ]
 
-    def evaluate(self, history: Sequence[Candle]) -> AdapterSignal | None:
+    @classmethod
+    def _legacy_window(cls, history: Sequence[Candle]) -> list[dict[str, float | int]]:
+        return cls._legacy_candles(history[-cls.window_size:])
+
+    def evaluate(
+        self,
+        history: Sequence[Candle],
+        *,
+        btc_history: Sequence[Candle] | None = None,
+    ) -> AdapterSignal | None:
+        del btc_history
         raw = _legacy_strategy.evaluate_signal(self._legacy_window(history))
         if raw is None:
             return None
@@ -46,6 +57,73 @@ class VersionAAdapter:
         }
         return AdapterSignal(
             action=raw["action"],
+            score=Decimal(str(raw["score"])),
+            reference_price=Decimal(str(raw["price"])),
+            stop_loss=(None if raw["stop_loss"] is None else Decimal(str(raw["stop_loss"]))),
+            take_profit=(None if raw["take_profit"] is None else Decimal(str(raw["take_profit"]))),
+            metadata=metadata,
+        )
+
+
+class VersionBAdapter(VersionAAdapter):
+    """Version B: Version A signal gated by the unchanged Legacy BTC filter."""
+
+    strategy_name = "Version B"
+    strategy_version = "legacy-strategy-b"
+    requires_btc_context = True
+    btc_long_window_size = _legacy_strategy.BTC_EMA200_WINDOW
+
+    def __init__(self) -> None:
+        self._btc_filter_cache: dict[tuple[object, ...], bool] = {}
+
+    def evaluate(
+        self,
+        history: Sequence[Candle],
+        *,
+        btc_history: Sequence[Candle] | None = None,
+    ) -> AdapterSignal | None:
+        raw = _legacy_strategy.evaluate_signal(self._legacy_window(history))
+        if raw is None:
+            return None
+
+        current_close_time = history[-1].close_time
+        aligned = bool(
+            btc_history
+            and btc_history[-1].symbol == "BTCUSDT"
+            and btc_history[-1].close_time == current_close_time
+        )
+        btc_filter = False
+        if raw["action"] == "BUY_NOW" and aligned:
+            assert btc_history is not None
+            cache_key = (
+                current_close_time,
+                len(btc_history),
+                btc_history[-1].close,
+            )
+            if cache_key not in self._btc_filter_cache:
+                self._btc_filter_cache[cache_key] = _legacy_strategy.evaluate_btc_filter(
+                    self._legacy_window(btc_history),
+                    self._legacy_candles(btc_history[-self.btc_long_window_size:]),
+                )
+            btc_filter = self._btc_filter_cache[cache_key]
+
+        action = raw["action"]
+        if action == "BUY_NOW" and not btc_filter:
+            action = "IGNORE"
+        metadata = {
+            key: raw[key]
+            for key in ("up_trend", "volume_ratio", "atr_percent")
+        }
+        metadata.update({
+            "base_action": raw["action"],
+            "btc_filter": btc_filter,
+            "btc_timestamp_aligned": aligned,
+            "btc_close_time": (
+                btc_history[-1].close_time.isoformat() if aligned and btc_history else None
+            ),
+        })
+        return AdapterSignal(
+            action=action,
             score=Decimal(str(raw["score"])),
             reference_price=Decimal(str(raw["price"])),
             stop_loss=(None if raw["stop_loss"] is None else Decimal(str(raw["stop_loss"]))),

@@ -28,5 +28,11 @@ class StrategyAdapter(Protocol):
     strategy_version: str
     max_hold_minutes: int
     window_size: int
+    requires_btc_context: bool
 
-    def evaluate(self, history: Sequence[Candle]) -> AdapterSignal | None: ...
+    def evaluate(
+        self,
+        history: Sequence[Candle],
+        *,
+        btc_history: Sequence[Candle] | None = None,
+    ) -> AdapterSignal | None: ...

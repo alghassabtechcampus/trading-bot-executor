@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from .adapters import VersionAAdapter
+from .adapters import VersionAAdapter, VersionBAdapter
 from .config import (
     EndOfTestPolicy,
     ExecutionProfile,
@@ -34,6 +34,7 @@ def _utc(value: str) -> datetime:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run Backtest V2 Strategy A")
     parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--strategy", choices=("A", "B"), default="A")
     parser.add_argument("--symbol", action="append", dest="symbols", required=True)
     parser.add_argument("--start", type=_utc, required=True)
     parser.add_argument("--end", type=_utc, required=True)
@@ -74,25 +75,32 @@ def main(argv: list[str] | None = None) -> int:
         end_of_test_policy=EndOfTestPolicy.CLOSE_AT_END,
     )
     symbols = tuple(args.symbols)
+    adapter = VersionAAdapter() if args.strategy == "A" else VersionBAdapter()
+    if adapter.requires_btc_context and "BTCUSDT" not in symbols:
+        raise SystemExit("Strategy B requires --symbol BTCUSDT")
     loaded = load_market_data(
         args.data_dir,
         symbols=symbols,
         start=args.start,
         end=args.end,
         data_cutoff=args.data_cutoff,
-        warmup_candles=VersionAAdapter.window_size - 1,
+        warmup_candles=(
+            VersionBAdapter.btc_long_window_size - 1
+            if adapter.requires_btc_context
+            else VersionAAdapter.window_size - 1
+        ),
     )
     integration = IntegrationRunConfig(
         run=run, symbols=symbols, start=args.start, end=args.end
     )
     started = time.perf_counter()
-    result = IntegrationEngine(integration, VersionAAdapter()).run({
+    result = IntegrationEngine(integration, adapter).run({
         symbol: item.candles for symbol, item in loaded.items()
     })
     runtime = time.perf_counter() - started
     summary = result.summary
     output = {
-        "strategy": "Version A",
+        "strategy": adapter.strategy_name,
         "start": args.start.isoformat(),
         "end": args.end.isoformat(),
         "symbols": list(symbols),

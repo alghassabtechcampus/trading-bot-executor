@@ -122,6 +122,8 @@ class IntegrationEngine:
     def run(self, candles_by_symbol: Mapping[str, Sequence[Candle]]) -> BacktestRunResult:
         if set(candles_by_symbol) != set(self.config.symbols):
             raise ValueError("candles_by_symbol must exactly match configured symbols")
+        if self.adapter.requires_btc_context and "BTCUSDT" not in candles_by_symbol:
+            raise ValueError("this strategy requires BTCUSDT in the unified timeline")
         timeline = build_unified_timeline(candles_by_symbol)
         portfolio = PortfolioState.create(
             initial_capital=self.config.run.initial_capital,
@@ -245,7 +247,10 @@ class IntegrationEngine:
 
             candidates: list[tuple[SignalIntent, AdapterSignal]] = []
             for candle in frame.candles:
-                evaluated = self.adapter.evaluate(histories[candle.symbol])
+                evaluated = self.adapter.evaluate(
+                    histories[candle.symbol],
+                    btc_history=histories.get("BTCUSDT"),
+                )
                 if evaluated is None or evaluated.action != "BUY_NOW":
                     continue
                 signal_count += 1

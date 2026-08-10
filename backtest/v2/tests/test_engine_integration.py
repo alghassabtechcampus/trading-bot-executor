@@ -54,11 +54,13 @@ class ScheduledAdapter:
     strategy_version = "test-fixture"
     max_hold_minutes = 90
     window_size = 200
+    requires_btc_context = False
 
     def __init__(self, signal_times):
         self.signal_times = set(signal_times)
 
-    def evaluate(self, history):
+    def evaluate(self, history, *, btc_history=None):
+        del btc_history
         current = history[-1]
         if (current.symbol, current.close_time) not in self.signal_times:
             return None
