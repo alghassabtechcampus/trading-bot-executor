@@ -1,7 +1,14 @@
-"""Backtest Engine V2 core package (Phases 1 and 2)."""
+"""Backtest Engine V2 core package (Phases 1 through 3)."""
 
 from .config import ExecutionProfile, FinancialAssumptions, RunConfig
-from .models import Candle, ClosedTrade, ExitReason
+from .models import (
+    Candle,
+    ClosedTrade,
+    ExitReason,
+    RejectionReason,
+    SignalIntent,
+    SignalSide,
+)
 
 __all__ = [
     "Candle",
@@ -9,5 +16,8 @@ __all__ = [
     "ExecutionProfile",
     "ExitReason",
     "FinancialAssumptions",
+    "RejectionReason",
     "RunConfig",
+    "SignalIntent",
+    "SignalSide",
 ]
