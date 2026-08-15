@@ -39,6 +39,13 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "12"))
 SIGNAL_LOCK_SECONDS = int(os.getenv("SIGNAL_LOCK_SECONDS", "86400"))
 MAX_HOLD_MINUTES = int(os.getenv("MAX_HOLD_MINUTES", "90"))
 
+# نوع أمر الدخول: Limit (صانع سيولة/maker، يحقّق حافة الاستراتيجية) أو Market (taker، فوري).
+ENTRY_ORDER_TYPE = os.getenv("ENTRY_ORDER_TYPE", "Limit").strip().capitalize()
+# نضع أمر الشراء المحدّد أقل من سعر الإشارة بهذا المقدار (نقاط أساس) لتفادي عبور السبريد.
+ENTRY_LIMIT_OFFSET_BPS = Decimal(os.getenv("ENTRY_LIMIT_OFFSET_BPS", "0"))
+# نلغي أمر الدخول المحدّد إذا لم يُنفَّذ خلال هذه الدقائق (الإشارة أصبحت قديمة).
+ENTRY_TIMEOUT_MINUTES = int(os.getenv("ENTRY_TIMEOUT_MINUTES", "15"))
+
 # العملات الموجودة قبل تشغيل البوت والتي لا نريد بيع رصيدها القديم.
 # البوت سيبيع فقط executed_qty المخزنة للصفقة، لذلك القائمة للحماية الإضافية.
 PROTECTED_COINS = {
@@ -357,6 +364,26 @@ def get_qty_step(symbol: str) -> tuple[Decimal, Decimal]:
     return qty_step, min_qty
 
 
+def get_instrument_filters(symbol: str) -> dict[str, Decimal]:
+    """فلاتر التداول اللازمة لأمر محدّد: خطوة الكمية، الحد الأدنى، حجم التك، والحد الأدنى للقيمة."""
+    params = {"category": "spot", "symbol": symbol}
+    payload = bybit_get("/v5/market/instruments-info", params)
+    ensure_bybit_success(payload, "instrument info")
+
+    instruments = payload.get("result", {}).get("list", [])
+    if not instruments:
+        raise RuntimeError(f"No instrument info returned for {symbol}")
+
+    lot = instruments[0].get("lotSizeFilter", {})
+    price_filter = instruments[0].get("priceFilter", {})
+    return {
+        "qty_step": as_decimal(lot.get("basePrecision", "0.00000001"), "basePrecision"),
+        "min_qty": as_decimal(lot.get("minOrderQty", "0"), "minOrderQty"),
+        "min_amt": as_decimal(lot.get("minOrderAmt", "0"), "minOrderAmt"),
+        "tick_size": as_decimal(price_filter.get("tickSize", "0.00000001"), "tickSize"),
+    }
+
+
 # ============================================================
 # أوامر Bybit
 # ============================================================
@@ -380,6 +407,57 @@ def create_market_buy(
     payload = bybit_post("/v5/order/create", body)
     ensure_bybit_success(payload, "market buy")
     return payload
+
+
+def create_limit_buy(
+    symbol: str,
+    quote_amount: Decimal,
+    limit_price: Decimal,
+    order_link_id: str,
+) -> tuple[dict[str, Any], Decimal, Decimal]:
+    """أمر شراء محدّد بدور صانع السيولة (PostOnly): يُرفض إذا كان سيعبر السبريد فورًا.
+
+    كمية أوامر spot المحدّدة تُحدَّد بالعملة الأساسية، فنحوّل مبلغ الاقتباس إلى كمية.
+    """
+    filters = get_instrument_filters(symbol)
+    price = floor_to_step(limit_price, filters["tick_size"])
+    if price <= 0:
+        raise ValueError("limit price must be positive")
+
+    base_quantity = floor_to_step(quote_amount / price, filters["qty_step"])
+    if base_quantity <= 0 or base_quantity < filters["min_qty"]:
+        raise ValueError(
+            f"Buy quantity {base_quantity} is below minimum {filters['min_qty']}"
+        )
+    if base_quantity * price < filters["min_amt"]:
+        raise ValueError(
+            f"Order notional {base_quantity * price} is below minimum {filters['min_amt']}"
+        )
+
+    body = {
+        "category": "spot",
+        "symbol": symbol,
+        "side": "Buy",
+        "orderType": "Limit",
+        "qty": decimal_str(base_quantity),
+        "price": decimal_str(price),
+        "timeInForce": "PostOnly",
+        "orderLinkId": order_link_id[:36],
+    }
+
+    payload = bybit_post("/v5/order/create", body)
+    ensure_bybit_success(payload, "limit buy")
+    return payload, price, base_quantity
+
+
+def cancel_order(symbol: str, order_id: str) -> dict[str, Any] | None:
+    """إلغاء أمر مفتوح. نتسامح مع الفشل لأن الأمر قد يكون نُفّذ أو أُلغي مسبقًا."""
+    body = {"category": "spot", "symbol": symbol, "orderId": order_id}
+    try:
+        return bybit_post("/v5/order/cancel", body)
+    except RuntimeError:
+        logger.info("Cancel skipped (order already closed?) for %s %s", symbol, order_id)
+        return None
 
 
 def create_market_sell(
@@ -494,6 +572,14 @@ def signal_key(signal_id: str) -> str:
     return f"signal:{signal_id}"
 
 
+def pending_key(symbol: str) -> str:
+    return f"pending:{symbol}"
+
+
+def pending_entry(symbol: str) -> dict[str, Any] | None:
+    return redis_get_json(pending_key(symbol))
+
+
 def reserve_signal(signal_id: str, symbol: str) -> bool:
     return redis_set_json(
         signal_key(signal_id),
@@ -603,6 +689,101 @@ def close_tracked_trade(
 
 
 # ============================================================
+# الأوامر المعلّقة (دخول محدّد / limit)
+# ============================================================
+
+def _trade_from_pending(pending: dict[str, Any], details: dict[str, Any]) -> dict[str, Any]:
+    """بناء سجل صفقة مكتملة من أمر دخول محدّد تم تنفيذه."""
+    symbol = pending["symbol"]
+    return {
+        "trade_id": pending.get("trade_id"),
+        "symbol": symbol,
+        "coin": coin_from_symbol(symbol),
+        "signal_id": pending.get("signal_id"),
+        "buy_order_id": details["order_id"],
+        "buy_status": details["status"],
+        "order_type": "Limit",
+        "analysis_price": pending.get("analysis_price"),
+        "buy_price": decimal_str(details["average_price"]),
+        "buy_value": decimal_str(details["executed_value"]),
+        "executed_qty": decimal_str(details["executed_qty"]),
+        "stop_loss": pending["stop_loss"],
+        "take_profit": pending["take_profit"],
+        "time": int(time.time()),
+    }
+
+
+def resolve_pending_entries() -> list[dict[str, Any]]:
+    """تحويل أوامر الدخول المحدّدة المنفّذة إلى صفقات، وإلغاء ما تأخّر أو رُفض.
+
+    يُستدعى دوريًا (من monitor_positions) لأن أمر PostOnly قد يبقى على الأوردر بوك.
+    """
+    results: list[dict[str, Any]] = []
+
+    for key in redis_keys("pending:*"):
+        symbol = key.replace("pending:", "", 1)
+        pending = pending_entry(symbol)
+        if not pending:
+            continue
+
+        order_id = str(pending.get("entry_order_id", ""))
+        signal_id = str(pending.get("signal_id", ""))
+        age_minutes = (time.time() - int(pending.get("time", 0))) / 60
+
+        try:
+            order = get_order(symbol, order_id) if order_id else None
+            status = order.get("orderStatus") if order else None
+            executed_qty = (
+                as_decimal(order.get("cumExecQty", "0"), "cumExecQty")
+                if order else Decimal("0")
+            )
+
+            if executed_qty > 0 and status in {
+                "Filled", "PartiallyFilled", "PartiallyFilledCanceled",
+            }:
+                # امتلاء كامل أو جزئي: نلغي المتبقي إن وُجد ونسجّل المنفّذ فقط.
+                if status != "Filled":
+                    cancel_order(symbol, order_id)
+                details = execution_details(order)
+                trade = _trade_from_pending(pending, details)
+                redis_set_json(trade_key(symbol), trade)
+                redis_delete(pending_key(symbol))
+                mark_signal(signal_id, symbol, "executed", order_id=details["order_id"])
+                results.append({
+                    "symbol": symbol, "pending": "filled",
+                    "trade_id": trade["trade_id"],
+                    "buy_price": trade["buy_price"],
+                })
+
+            elif status in {"Cancelled", "Rejected", "Deactivated"}:
+                redis_delete(pending_key(symbol))
+                mark_signal(signal_id, symbol, f"entry_{str(status).lower()}")
+                results.append({"symbol": symbol, "pending": "closed", "status": status})
+
+            elif age_minutes >= ENTRY_TIMEOUT_MINUTES:
+                # لم يُنفَّذ خلال المهلة: الإشارة قديمة، نلغي الأمر.
+                cancel_order(symbol, order_id)
+                redis_delete(pending_key(symbol))
+                mark_signal(signal_id, symbol, "entry_timeout")
+                results.append({
+                    "symbol": symbol, "pending": "timeout",
+                    "age_minutes": round(age_minutes, 1),
+                })
+
+            else:
+                results.append({
+                    "symbol": symbol, "pending": "resting",
+                    "status": status, "age_minutes": round(age_minutes, 1),
+                })
+
+        except Exception as exc:
+            logger.exception("Pending entry resolution failed for %s", symbol)
+            results.append({"symbol": symbol, "error": str(exc)})
+
+    return results
+
+
+# ============================================================
 # المسارات
 # ============================================================
 
@@ -645,7 +826,12 @@ def check_position():
 
     trade = tracked_trade(symbol)
     if not trade:
-        return jsonify({"has_position": False}), 200
+        pending = pending_entry(symbol)
+        return jsonify({
+            "has_position": False,
+            "has_pending": pending is not None,
+            "pending": pending,
+        }), 200
 
     executed_qty = as_decimal(
         trade.get("executed_qty", "0"),
@@ -748,6 +934,13 @@ def execute():
             "symbol": symbol,
         }), 409
 
+    # منع دخول جديد إذا كان هناك أمر دخول محدّد معلّق لنفس العملة.
+    if pending_entry(symbol):
+        return jsonify({
+            "status": "pending_exists",
+            "symbol": symbol,
+        }), 409
+
     # حجز ذري للإشارة قبل إرسال أمر الشراء.
     try:
         reserved = reserve_signal(signal_id, symbol)
@@ -781,6 +974,59 @@ def execute():
                 "required": decimal_str(required_balance),
             }), 400
 
+        # مسار الدخول المحدّد (maker): نضع الأمر ونتركه معلّقًا ليُحلّ لاحقًا.
+        if ENTRY_ORDER_TYPE == "Limit":
+            limit_price = analysis_price * (
+                Decimal("1") - ENTRY_LIMIT_OFFSET_BPS / Decimal("10000")
+            )
+            response, placed_price, base_qty = create_limit_buy(
+                symbol,
+                quote_amount,
+                limit_price,
+                signal_id,
+            )
+
+            order_id = response.get("result", {}).get("orderId")
+            if not order_id:
+                raise RuntimeError("Limit buy response does not contain orderId")
+
+            pending = {
+                "trade_id": trade_id,
+                "symbol": symbol,
+                "coin": coin_from_symbol(symbol),
+                "signal_id": signal_id,
+                "entry_order_id": order_id,
+                "order_type": "Limit",
+                "limit_price": decimal_str(placed_price),
+                "base_qty": decimal_str(base_qty),
+                "quote_amount": decimal_str(quote_amount),
+                "analysis_price": decimal_str(analysis_price),
+                "stop_loss": decimal_str(stop_loss),
+                "take_profit": decimal_str(take_profit),
+                "time": int(time.time()),
+            }
+
+            redis_set_json(
+                pending_key(symbol),
+                pending,
+                ex_seconds=SIGNAL_LOCK_SECONDS,
+            )
+            mark_signal(signal_id, symbol, "pending_entry", order_id=order_id)
+
+            logger.info(
+                json.dumps(
+                    {"symbol": symbol, "action": "BUY_LIMIT_PLACED", "pending": pending},
+                    ensure_ascii=False,
+                )
+            )
+
+            return jsonify({
+                "status": "pending_entry",
+                "pending": pending,
+                "order": response,
+            }), 200
+
+        # مسار الدخول الفوري (Market، taker).
         response = create_market_buy(
             symbol,
             quote_amount,
@@ -801,6 +1047,7 @@ def execute():
             "signal_id": signal_id,
             "buy_order_id": details["order_id"],
             "buy_status": details["status"],
+            "order_type": "Market",
             "analysis_price": decimal_str(analysis_price),
             "buy_price": decimal_str(details["average_price"]),
             "buy_value": decimal_str(details["executed_value"]),
@@ -888,7 +1135,9 @@ def monitor_positions():
     """
     يجب استدعاء هذا المسار دوريًا من n8n، مثل كل دقيقة.
     إذا وصل السعر إلى وقف الخسارة أو الهدف، ينفذ البيع.
+    كما يحلّ أوامر الدخول المحدّدة المعلّقة (limit): تنفيذ، إلغاء، أو انتهاء مهلة.
     """
+    pending_results = resolve_pending_entries()
     results: list[dict[str, Any]] = []
 
     for key in redis_keys("trade:*"):
@@ -948,7 +1197,10 @@ def monitor_positions():
                 "error": str(exc),
             })
 
-    return jsonify({"result": results}), 200
+    return jsonify({
+        "result": results,
+        "pending": pending_results,
+    }), 200
 
 
 @app.route("/positions", methods=["GET"])
