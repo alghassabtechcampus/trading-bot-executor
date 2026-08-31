@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>لوحة مؤشرات الكريبتو</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>📊 لوحة مؤشرات الكريبتو — عرض ومراجعة فقط</h1>
+    <div class="refresh-info">
+      <span class="dot" id="refresh-dot"></span>
+      <span id="last-refresh-text">جاري التحميل...</span>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs"></nav>
+
+  <nav class="tf-bar">
+    <div class="tf-field">
+      <label for="tf-trend">فريم الاتجاه العام</label>
+      <select id="tf-trend" class="tf-select" data-key="trend">
+        <option value="15m">15 دقيقة</option>
+        <option value="1h">ساعة</option>
+        <option value="4h" selected>4 ساعات</option>
+        <option value="1d">يومي</option>
+        <option value="1w">أسبوعي</option>
+      </select>
+    </div>
+    <div class="tf-field">
+      <label for="tf-entry">فريم توقيت الدخول</label>
+      <select id="tf-entry" class="tf-select" data-key="entry">
+        <option value="15m">15 دقيقة</option>
+        <option value="1h" selected>ساعة</option>
+        <option value="4h">4 ساعات</option>
+        <option value="1d">يومي</option>
+        <option value="1w">أسبوعي</option>
+      </select>
+    </div>
+    <div class="tf-field">
+      <label for="tf-levels">فريم الدعم والمقاومة</label>
+      <select id="tf-levels" class="tf-select" data-key="levels">
+        <option value="15m">15 دقيقة</option>
+        <option value="1h">ساعة</option>
+        <option value="4h">4 ساعات</option>
+        <option value="1d" selected>يومي</option>
+        <option value="1w">أسبوعي</option>
+      </select>
+    </div>
+    <button id="tf-reset" class="tf-reset-btn" title="الرجوع للفريمات الافتراضية">↺ افتراضي</button>
+  </nav>
+
+  <main id="main-content">
+    <div class="no-setup-msg">جاري تحميل البيانات...</div>
+  </main>
+
+  <div id="loading-overlay" class="loading-overlay hidden">
+    <div class="spinner"></div>
+    <div class="loading-text">جاري إعادة الحساب بالفريمات الجديدة...</div>
+  </div>
+
+  <footer>
+    هذه الصفحة للعرض والمراجعة فقط — لا يوجد تنفيذ آلي لأي صفقة. القرار النهائي دائمًا للمستخدم.
+  </footer>
+
+  <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>

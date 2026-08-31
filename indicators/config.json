@@ -1,0 +1,15 @@
+{
+  "market": "crypto",
+  "trend_timeframe": "4h",
+  "entry_timeframe": "1h",
+  "levels_timeframe": "1d",
+  "scheduler_interval": "1h",
+  "levels_lookback_bars": 20,
+  "levels_touch_tolerance_pct": 0.5,
+  "levels_min_touches": 2,
+  "atr_period": 14,
+  "stop_atr_mult": 1.0,
+  "target_atr_mult": 2.0,
+  "entry_zone_pct": 0.3,
+  "vwap_volume_avg_bars": 20
+}

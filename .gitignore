@@ -8,7 +8,7 @@ venv/
 .venv/
 
 # Python caches
-**pycache**/
+__pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
@@ -31,6 +31,13 @@ backtest/data/
 backtest/results/
 backtest/*.log
 backtest/v2/runs/
+
+# Generated indicator dashboard outputs
+indicators/cache/
+indicators/history/
+indicators/dashboard_snapshot.json
+indicators/alert_state.json
+indicators/pending_alerts.json
 
 # Local assistant/tool config
 .claude/

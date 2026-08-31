@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+cache/
+history/
+dashboard_snapshot.json
+alert_state.json
+pending_alerts.json

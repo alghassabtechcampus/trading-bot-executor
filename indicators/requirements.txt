@@ -1,0 +1,12 @@
+Flask==3.1.0
+Werkzeug==3.1.8
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+itsdangerous==2.2.0
+click==8.4.2
+blinker==1.9.0
+gunicorn==23.0.0
+requests==2.32.3
+pandas==3.0.5
+numpy==2.5.1
+pyarrow==25.0.1
