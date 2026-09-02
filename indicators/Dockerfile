@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # Standalone image for the indicators dashboard + alert-watcher service.
 # Build context MUST be the indicators/ directory itself (not the repo
 # root) -- Dokploy's "build path" / "docker context path" setting should
@@ -9,22 +7,24 @@
 # this service only reads Bybit's PUBLIC market-data REST endpoints
 # (klines, funding, open interest), which need no API key at all.
 #
-# The `# syntax=` pragma above opts into BuildKit's extended Dockerfile
-# frontend so `RUN --network=host` below is available. Some fresh
-# Docker-host setups (systemd-resolved bound to a host-only loopback
-# resolver, e.g. 127.0.0.53) leave the *default bridge* network BuildKit
-# uses for RUN steps unable to resolve DNS at all, even though the host
-# itself resolves fine -- pip install then fails with "Temporary failure
-# in name resolution" reaching PyPI. Running just this one step on the
-# host's own network namespace sidesteps that without touching the Docker
-# daemon's config or needing host/SSH access.
+# DNS note: some fresh Docker hosts leave BuildKit's default bridge
+# network for RUN steps unable to resolve DNS at all (host itself
+# resolves fine -- systemd-resolved often binds a host-only loopback
+# resolver like 127.0.0.53 that containers can't reach), so a plain
+# `pip install` fails with "Temporary failure in name resolution"
+# reaching PyPI. `RUN --network=host` would fix it but needs a BuildKit
+# entitlement ("network.host is not allowed") that isn't granted here.
+# Overwriting /etc/resolv.conf for just this layer needs no special
+# privilege and works whether or not that root cause applies.
 
 FROM python:3.12-slim
 
 WORKDIR /app
 
 COPY requirements.txt ./indicators/requirements.txt
-RUN --network=host pip install --no-cache-dir -r indicators/requirements.txt
+RUN echo "nameserver 8.8.8.8" > /etc/resolv.conf \
+ && echo "nameserver 1.1.1.1" >> /etc/resolv.conf \
+ && pip install --no-cache-dir -r indicators/requirements.txt
 
 COPY . ./indicators/
 
