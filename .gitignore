@@ -50,3 +50,4 @@ indicators/alert_outcomes.json
 
 # Local assistant/tool config
 .claude/
+backtest/analysis/exit_mechanics_results.parquet
