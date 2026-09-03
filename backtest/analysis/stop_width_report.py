@@ -1,5 +1,18 @@
 """Reads stop_width_results.parquet and applies the PRE-COMMITTED decision
-bar from stop_width_study.py's docstring. Reports pooled, dev/OOS, and
+bar from stop_width_study.py's docstring -- POOLED ACROSS ALL THREE COMBOS.
+
+SUPERSEDED for decision-making by stop_width_report_per_combo.py. The bar
+here is applied once, to all combos merged: `pd.concat` of the three OOS
+segments for criterion (a), and walk-forward windows averaged across combos
+(with equal weight per combo, so a ~50-signal slow window counted as much as
+a ~230-signal fast one) for criterion (b). That answers "one stop for the
+whole system", which is not the question -- the combos trade different
+timeframes and alert_watcher already runs them independently. Judged
+separately, the medium combo reaches a DIFFERENT verdict than this file
+reports. Keep this script for the pooled view; take verdicts from the
+per-combo one.
+
+Original description follows. Reports pooled, dev/OOS, and
 per-window numbers, plus how many signals the 3% reachability filter removes.
 
 Average R is taken PER SIGNAL, with never-filled signals counted as 0R. That
