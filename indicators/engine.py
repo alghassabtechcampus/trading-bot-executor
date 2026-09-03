@@ -57,6 +57,7 @@ def compute_symbol(symbol: str, config: DashboardConfig, source: DataSource) -> 
         confluence_result["direction"], current_price, sr_result, entry_atr,
         stop_atr_mult=config.stop_atr_mult, target_atr_mult=config.target_atr_mult,
         entry_zone_pct=config.entry_zone_pct,
+        max_entry_distance_pct=config.entry_max_distance_pct,
     )
 
     return {

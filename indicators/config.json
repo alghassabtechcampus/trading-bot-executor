@@ -11,5 +11,6 @@
   "stop_atr_mult": 1.0,
   "target_atr_mult": 2.0,
   "entry_zone_pct": 0.3,
-  "vwap_volume_avg_bars": 20
+  "vwap_volume_avg_bars": 20,
+  "entry_max_distance_pct": 3.0
 }

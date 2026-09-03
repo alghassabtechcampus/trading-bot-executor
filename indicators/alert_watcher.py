@@ -13,7 +13,23 @@ Trigger + Execute Command + Telegram node is meant to consume its output
 of n8n orchestrating a plain Python script (signal_runner.py, dashboard's
 run_dashboard.py) rather than holding logic itself.
 
-State: indicators/alert_state.json, one entry per "SYMBOL|combo_key":
+Files (all under INDICATORS_DATA_DIR, which defaults to this directory --
+point it at a mounted volume in Docker so they survive a redeploy):
+
+  alert_log.jsonl     - APPEND-ONLY permanent record. One JSON object per
+                        alert ever fired, never rewritten or truncated.
+                        Every field a later performance review needs is a
+                        real number in its own key (entry_low, entry_high,
+                        stop, target, ...), so nothing has to be recovered
+                        by regexing the Arabic message text.
+  pending_alerts.json - THIS RUN's alerts only, rewritten each run. This is
+                        deliberately NOT cumulative: the n8n Telegram node
+                        reads it and sends whatever it finds, so making it
+                        append-only would re-send the whole history every
+                        cycle. alert_log.jsonl is the archive; this file
+                        stays a one-shot outbox.
+
+State: alert_state.json, one entry per "SYMBOL|combo_key":
   confirmed_setup   - the last setup value an alert was actually fired for
                        (or established as the no-alert baseline on first run)
   pending_setup     - a candidate new setup seen but not yet confirmed
@@ -35,6 +51,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,8 +64,14 @@ from indicators.config import load_config  # noqa: E402
 from indicators.engine import compute_symbol  # noqa: E402
 from indicators.sources import DataSource, MarketHours, get_source  # noqa: E402
 
-STATE_PATH = Path(__file__).resolve().parent / "alert_state.json"
-PENDING_ALERTS_PATH = Path(__file__).resolve().parent / "pending_alerts.json"
+# Runtime files live in DATA_DIR, not necessarily next to the code: in Docker
+# the image is replaced wholesale on every deploy, so anything written inside
+# it is lost. Pointing INDICATORS_DATA_DIR at a mounted volume keeps the state
+# machine's memory -- and the alert archive -- across redeploys.
+DATA_DIR = Path(os.getenv("INDICATORS_DATA_DIR") or Path(__file__).resolve().parent)
+STATE_PATH = DATA_DIR / "alert_state.json"
+PENDING_ALERTS_PATH = DATA_DIR / "pending_alerts.json"
+ALERT_LOG_PATH = DATA_DIR / "alert_log.jsonl"
 
 COMBOS: dict[str, dict[str, str]] = {
     "سريعة":  {"trend": "1h", "entry": "15m", "levels": "1d"},
@@ -102,15 +125,76 @@ def save_state(state: dict) -> None:
         json.dump(state, handle, indent=2, ensure_ascii=False)
 
 
+def format_split(conf: dict) -> str:
+    """Full bullish/bearish/neutral breakdown, never just the winning count.
+    "2/4 صاعد" was ambiguous -- it reads as a 2-2 tie, but a tie can never
+    reach an entry alert at all (tie -> confluence "neutral" -> trade_zone
+    setup "none"), so it always meant 2 bullish vs at most 1 bearish, the
+    rest neutral. Spelling out all three counts removes the reading that
+    was never true."""
+    bull, bear = conf["bullish_count"], conf["bearish_count"]
+    total = conf["total_indicators"]
+    return f"{bull} صاعد / {bear} هابط / {total - bull - bear} محايد (من {total})"
+
+
+def append_alert_log(records: list[dict]) -> None:
+    """Appends one JSON line per alert. Opened in "a" mode so a run can only
+    ever add to the file -- no code path here rewrites or truncates it. JSONL
+    (not a JSON array) precisely so appending never requires reading,
+    re-parsing, or re-serialising what is already there: a half-written tail
+    costs one line, not the archive."""
+    if not records:
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with ALERT_LOG_PATH.open("a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def build_log_record(symbol: str, combo_name: str, combo_tf: dict, result: dict,
+                     alert: dict, sent_at: str) -> dict:
+    """Flattens one alert into an archive row. Every price is a number in its
+    own field; `text` is kept only so the exact message a user received stays
+    auditable -- never as the source the numbers are read back from."""
+    tz = result["trade_zone"]
+    conf = result["confluence"]
+    entry_low, entry_high = (tz.get("entry_zone") or [None, None])
+    return {
+        "sent_at": sent_at,
+        "symbol": symbol,
+        "combo": combo_name,
+        "alert_type": alert["type"],
+        "setup": tz["setup"],
+        "trend_timeframe": combo_tf["trend"],
+        "entry_timeframe": combo_tf["entry"],
+        "levels_timeframe": combo_tf["levels"],
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "stop": tz.get("stop_loss"),
+        "target": tz.get("target"),
+        "rr_ratio": tz.get("rr_ratio"),
+        "reference_level": tz.get("reference_level"),
+        "entry_distance_pct": tz.get("entry_distance_pct"),
+        "current_price": result["current_price"],
+        "as_of": result["as_of"],
+        "direction": conf["direction"],
+        "bullish_count": conf["bullish_count"],
+        "bearish_count": conf["bearish_count"],
+        "total_indicators": conf["total_indicators"],
+        "text": alert["text"],
+    }
+
+
 def build_entry_message(symbol: str, combo_name: str, combo_tf: dict, result: dict) -> str:
+    """Only ever called for result["trade_zone"]["setup"] == "long" -- the
+    exact condition the dashboard uses to show a suggested entry zone.
+    process_one() enforces that; see tests/test_alert_consistency.py."""
     conf = result["confluence"]
     tz = result["trade_zone"]
-    total = conf["total_indicators"]
-    bull = conf["bullish_count"]
     entry_low, entry_high = tz["entry_zone"]
     return (
         f"🟢 {symbol} — فرصة شراء جديدة [نوع: {combo_name} | اتجاه {combo_tf['trend']} + دخول {combo_tf['entry']}]\n"
-        f"توافق {bull}/{total} صاعد\n"
+        f"التوافق: {format_split(conf)}\n"
         f"دخول {format_price(entry_low)}-{format_price(entry_high)} / "
         f"وقف {format_price(tz['stop_loss'])} / هدف {format_price(tz['target'])}"
     )
@@ -118,15 +202,14 @@ def build_entry_message(symbol: str, combo_name: str, combo_tf: dict, result: di
 
 def build_exit_message(symbol: str, combo_name: str, result: dict) -> str:
     conf = result["confluence"]
-    total = conf["total_indicators"]
-    bull, bear = conf["bullish_count"], conf["bearish_count"]
     direction = conf["direction"]
+    split = format_split(conf)
     if direction == "neutral":
-        reason = f"فقد التوافق (بقى {bull}/{total})"
+        reason = f"فقد التوافق — {split}"
     elif direction == "bearish":
-        reason = f"انعكس الاتجاه لهابط ({bear}/{total})"
+        reason = f"انعكس الاتجاه لهابط — {split}"
     else:
-        reason = f"تغيّر التوافق ({bull}/{total} صاعد)"
+        reason = f"تغيّر التوافق — {split}"
     return f"⚪ {symbol} — انتهت فرصة الشراء [نوع: {combo_name}]\nالسبب: {reason}"
 
 
@@ -192,6 +275,7 @@ def run_check(log=None) -> list[dict]:
     log(f"Combos: {list(COMBOS.keys())}  Symbols: {symbols}")
 
     alerts: list[dict] = []
+    log_records: list[dict] = []
     for combo_name, combo_tf in COMBOS.items():
         run_config = dataclasses.replace(base_config, trend_timeframe=combo_tf["trend"],
                                           entry_timeframe=combo_tf["entry"], levels_timeframe=combo_tf["levels"])
@@ -208,10 +292,15 @@ def run_check(log=None) -> list[dict]:
             log(f"  {symbol:<10} [{combo_name:<6}] setup={setup:<18}{note}")
             if alert:
                 alerts.append(alert)
+                log_records.append(
+                    build_log_record(symbol, combo_name, combo_tf, result, alert, checked_at))
 
     save_state(state)
+    append_alert_log(log_records)          # permanent archive -- only ever grows
     PENDING_ALERTS_PATH.write_text(json.dumps(alerts, indent=2, ensure_ascii=False), encoding="utf-8")
     log(f"\n{len(alerts)} alert(s) this run.")
+    if log_records:
+        log(f"Appended {len(log_records)} record(s) -> {ALERT_LOG_PATH}")
     return alerts
 
 
@@ -220,8 +309,10 @@ def main() -> None:
     for a in alerts:
         print("-" * 60)
         print(a["text"])
-    print(f"\nState saved -> {STATE_PATH}")
-    print(f"Alerts written -> {PENDING_ALERTS_PATH}")
+    archived = sum(1 for _ in ALERT_LOG_PATH.open(encoding="utf-8")) if ALERT_LOG_PATH.exists() else 0
+    print(f"\nState saved       -> {STATE_PATH}")
+    print(f"This-run outbox   -> {PENDING_ALERTS_PATH}")
+    print(f"Permanent archive -> {ALERT_LOG_PATH} ({archived} record(s) total)")
 
 
 if __name__ == "__main__":

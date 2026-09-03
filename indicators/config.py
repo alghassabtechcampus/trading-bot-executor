@@ -18,7 +18,8 @@ from pathlib import Path
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
 _INT_KEYS = {"levels_lookback_bars", "levels_min_touches", "atr_period", "vwap_volume_avg_bars"}
-_FLOAT_KEYS = {"levels_touch_tolerance_pct", "stop_atr_mult", "target_atr_mult", "entry_zone_pct"}
+_FLOAT_KEYS = {"levels_touch_tolerance_pct", "stop_atr_mult", "target_atr_mult", "entry_zone_pct",
+               "entry_max_distance_pct"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,7 @@ class DashboardConfig:
     stop_atr_mult: float
     target_atr_mult: float
     entry_zone_pct: float
+    entry_max_distance_pct: float
     vwap_volume_avg_bars: int
 
 

@@ -27,6 +27,10 @@ htmlcov/
 # Generated market data
 backtest/data/
 
+# Stop-width study inputs/outputs (regenerate with backtest/fetch_stopstudy.py)
+backtest/data_stopstudy/
+backtest/analysis/stop_width_results.parquet
+
 # Generated backtest outputs
 backtest/results/
 backtest/*.log
@@ -37,7 +41,12 @@ indicators/cache/
 indicators/history/
 indicators/dashboard_snapshot.json
 indicators/alert_state.json
+# alert_log.jsonl is the permanent alert archive, but it is written by the
+# RUNNING service (on the server), not by a developer. It is kept out of git
+# and persisted with a Docker volume -- see indicators/Dockerfile.
+indicators/alert_log.jsonl
 indicators/pending_alerts.json
+indicators/alert_outcomes.json
 
 # Local assistant/tool config
 .claude/

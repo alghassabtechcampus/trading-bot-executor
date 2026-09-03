@@ -165,6 +165,23 @@ function renderTradeZone(tz) {
       </div>`;
   }
 
+  if (tz.setup === "unreachable") {
+    return `
+      <div class="card">
+        <p class="card-title">منطقة الصفقة المقترحة</p>
+        <div class="trade-zone-box none">
+          <div class="tz-title">⚪ اتجاه صاعد — لكن نطاق الدخول بعيد عن السوق</div>
+          <div class="no-setup-msg" style="text-align: start; padding-inline-start: 2px;">${tz.message}</div>
+          <div class="tz-grid">
+            <div class="tz-item"><div class="k">النطاق المحسوب</div>
+              <div class="v num">${fmtNum(tz.entry_zone[0])} – ${fmtNum(tz.entry_zone[1])}</div></div>
+            <div class="tz-item"><div class="k">بُعده عن السعر</div>
+              <div class="v num">${fmtPct(tz.entry_distance_pct)}</div></div>
+          </div>
+        </div>
+      </div>`;
+  }
+
   // Only "long" reaches here -- this dashboard never proposes a short (sell) setup.
   return `
     <div class="card">

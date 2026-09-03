@@ -18,6 +18,16 @@ COPY . ./indicators/
 
 ENV PYTHONUNBUFFERED=1
 
+# Runtime state lives OUTSIDE the image. Deploying replaces the container
+# wholesale, so alert_state.json (the change-detection memory) and
+# alert_log.jsonl (the permanent alert archive) would be wiped on every
+# release if they stayed on the image filesystem -- and a wiped state file
+# silently re-baselines every symbol, suppressing alerts for a cycle. Mount a
+# named volume at /data in Dokploy to keep both across releases.
+ENV INDICATORS_DATA_DIR=/data
+RUN mkdir -p /data
+VOLUME ["/data"]
+
 EXPOSE 5050
 
 CMD ["gunicorn", "--bind", "0.0.0.0:5050", "--workers", "2", "--timeout", "60", "indicators.web:app"]
