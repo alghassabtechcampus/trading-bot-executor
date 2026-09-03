@@ -37,6 +37,26 @@ opportunity anyone can act on, just a price the market is nowhere near.
 Such a setup is reported (with the distance, so the dashboard can explain
 itself) but never packaged as an actionable entry, and alert_watcher.py
 never fires a buy alert on it -- it only ever alerts on setup == "long".
+
+TRAILING NOTE (advisory numbers only, no behaviour attached). A "long"
+also carries trail_arm_atr_mult / trail_atr_mult / atr_value. These are
+NOT used by anything here: the stop, target and setup are computed
+exactly as before and none of them reads these fields. They exist purely
+so the dashboard and the Telegram message can print one concrete
+suggestion -- "if price advances 0.5xATR, consider moving the stop to
+(highest price seen - 1.0xATR)" -- with real numbers rather than leaving
+the reader to do ATR arithmetic. Acting on it is manual and optional; no
+state is kept anywhere about whether a stop was actually moved.
+
+Why these two multipliers: backtest/analysis/exit_mechanics_study.py
+replayed 10,041 signals against eight exit mechanics, and a 1.0xATR trail
+armed after a 0.5xATR advance was the only one to clear the pre-committed
+bar on all three combos. Honest limits of that result, worth remembering
+before anyone builds on it: it is consistent in both development and
+out-of-sample on the fast and medium combos but out-of-sample ONLY on the
+slow one, and it does not make the system profitable -- it cuts the
+average loss from -1.00R to -0.48R while also cutting the average win
+from +2.57R to +0.63R. It reduces variance; it does not create an edge.
 """
 
 from __future__ import annotations
@@ -56,7 +76,8 @@ BEARISH_NO_SHORT_MESSAGE = (
 
 def compute(direction: str, current_price: float, sr: dict, atr_value: float | None,
             stop_atr_mult: float = 1.0, target_atr_mult: float = 2.0, entry_zone_pct: float = 0.3,
-            max_entry_distance_pct: float = 3.0) -> dict:
+            max_entry_distance_pct: float = 3.0,
+            trail_arm_atr_mult: float = 0.5, trail_atr_mult: float = 1.0) -> dict:
     if direction == "neutral":
         return {"setup": "none", "direction": "neutral", "reason": "no clear confluence direction"}
 
@@ -111,6 +132,13 @@ def compute(direction: str, current_price: float, sr: dict, atr_value: float | N
         "risk_pct_of_price": round(risk / current_price * 100, 4),
         "reward_pct_of_price": round(reward / current_price * 100, 4) if reward > 0 else None,
         "rr_ratio": round(rr_ratio, 2) if rr_ratio is not None else None,
+        # Advisory only -- see TRAILING NOTE below. Nothing in this module or
+        # in alert_watcher.py acts on these; they exist so the dashboard and
+        # the Telegram message can spell out one concrete suggestion instead
+        # of the reader having to do ATR arithmetic in their head.
+        "trail_arm_atr_mult": trail_arm_atr_mult,
+        "trail_atr_mult": trail_atr_mult,
+        "atr_value": round(atr_value, 8),
     }
 
 

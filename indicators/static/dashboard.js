@@ -143,6 +143,26 @@ function renderConfluence(conf) {
     </div>`;
 }
 
+// Advisory only. Renders nothing unless trade_zone supplied the trailing
+// fields, so an older cached payload degrades to the previous layout rather
+// than printing "NaN". Nothing here is tracked or acted on -- the dashboard
+// never knows whether the reader moved a stop.
+function trailHint(tz) {
+  if (tz.atr_value == null || !Array.isArray(tz.entry_zone)) return "";
+  const mid = (tz.entry_zone[0] + tz.entry_zone[1]) / 2;
+  const arm = mid + tz.trail_arm_atr_mult * tz.atr_value;
+  const distance = tz.trail_atr_mult * tz.atr_value;
+  const then = arm - distance;
+  return `
+    <div class="trail-hint">
+      💡 <b>نصيحة إدارة:</b> لو السعر تحرّك ${fmtNum(tz.trail_arm_atr_mult * tz.atr_value)}
+      (${tz.trail_arm_atr_mult}×ATR) لصالحك ووصل <b>${fmtNum(arm)}</b> — فكّر تحرّك الوقف
+      يدويًا إلى (أعلى سعر وصله − ${fmtNum(distance)}) ≈ <b>${fmtNum(then)}</b>،
+      وكمّل تحريكه لفوق مع كل قمة جديدة.
+      <span class="trail-hint-note">اقتراح للمراجعة اليدوية فقط — الداشبورد لا ينفّذ ولا يتابع أي وقف.</span>
+    </div>`;
+}
+
 function renderTradeZone(tz) {
   if (!tz || tz.setup === "none") {
     return `
@@ -197,6 +217,7 @@ function renderTradeZone(tz) {
           <div class="tz-item"><div class="k">مخاطرة</div><div class="v num">${fmtPct(tz.risk_pct_of_price)}</div></div>
           <div class="tz-item"><div class="k">عائد محتمل</div><div class="v num">${fmtPct(tz.reward_pct_of_price)}</div></div>
         </div>
+        ${trailHint(tz)}
         <div class="disclaimer">
           ⚠️ هذه منطقة مقترحة للمراجعة فقط، محسوبة آليًا من المؤشرات والدعم/المقاومة —
           <b>مش توصية تنفيذ تلقائي</b>. القرار النهائي بالدخول أو عدمه، وحجم الصفقة، يرجع بالكامل للمستخدم.

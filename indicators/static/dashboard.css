@@ -349,6 +349,28 @@ main {
 .tz-item .k { font-size: 11px; color: var(--text-2); }
 .tz-item .v { font-size: 15px; font-weight: 700; color: var(--text-1); }
 
+/* Sits between the trade numbers and the disclaimer. Deliberately quieter
+   than .disclaimer (which is a warning) -- this is a suggestion, not a
+   caveat, so it reads as a note rather than competing with the gold box. */
+.trail-hint {
+  font-size: 11.5px;
+  color: var(--text-2);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-inline-start: 3px solid var(--green);
+  border-radius: 8px;
+  padding: 8px 10px;
+  line-height: 1.7;
+  margin-bottom: 8px;
+}
+.trail-hint b { color: var(--text-1); }
+.trail-hint-note {
+  display: block;
+  margin-top: 4px;
+  font-size: 10.5px;
+  color: var(--gray);
+}
+
 .disclaimer {
   font-size: 11.5px;
   color: var(--gold);

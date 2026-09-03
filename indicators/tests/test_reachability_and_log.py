@@ -138,6 +138,60 @@ def test_log_record_carries_numbers_not_just_text():
     assert json.loads(json.dumps(rec, ensure_ascii=False))  # archive row is serialisable
 
 
+def test_trailing_fields_are_advisory_and_do_not_change_any_decision():
+    """The whole contract of the trailing hint: it adds fields and changes
+    nothing. Same inputs, different trail multipliers -> byte-identical
+    setup, entry zone, stop, target and R:R."""
+    a = trade_zone.compute("bullish", PRICE, zone_at(1.0), ATR,
+                           trail_arm_atr_mult=0.5, trail_atr_mult=1.0)
+    b = trade_zone.compute("bullish", PRICE, zone_at(1.0), ATR,
+                           trail_arm_atr_mult=9.9, trail_atr_mult=9.9)
+    for field in ("setup", "direction", "entry_zone", "stop_loss", "target",
+                  "rr_ratio", "reference_level", "entry_distance_pct",
+                  "risk_pct_of_price", "reward_pct_of_price"):
+        assert a[field] == b[field], field
+
+
+def test_trailing_fields_present_on_long_and_absent_elsewhere():
+    long_tz = trade_zone.compute("bullish", PRICE, zone_at(1.0), ATR)
+    assert long_tz["setup"] == "long"
+    assert long_tz["trail_arm_atr_mult"] == 0.5
+    assert long_tz["trail_atr_mult"] == 1.0
+    assert long_tz["atr_value"] == ATR
+
+    for tz in (trade_zone.compute("neutral", PRICE, zone_at(1.0), ATR),
+               trade_zone.compute("bearish", PRICE, zone_at(1.0), ATR),
+               trade_zone.compute("bullish", PRICE, zone_at(10.6), ATR)):
+        assert "atr_value" not in tz, tz["setup"]
+
+
+def test_trail_hint_numbers_are_arithmetically_right():
+    from indicators.alert_watcher import build_trail_hint
+
+    tz = trade_zone.compute("bullish", PRICE, zone_at(1.0), ATR)
+    mid = sum(tz["entry_zone"]) / 2
+    arm = mid + 0.5 * ATR
+    then = arm - 1.0 * ATR
+    hint = build_trail_hint(tz)
+    assert f"{arm:,.4f}" in hint, hint
+    assert f"{then:,.4f}" in hint, hint
+    # the suggested level must actually be an IMPROVEMENT on the original
+    # stop, otherwise the advice is worse than doing nothing
+    assert then > tz["stop_loss"]
+
+
+def test_entry_message_carries_the_hint_and_exit_message_does_not():
+    from indicators.alert_watcher import build_entry_message, build_exit_message
+
+    tz = trade_zone.compute("bullish", PRICE, zone_at(1.0), ATR)
+    result = {"trade_zone": tz, "current_price": PRICE, "as_of": "2026-09-03T00:00:00+00:00",
+              "confluence": {"direction": "bullish", "bullish_count": 3, "bearish_count": 1,
+                             "total_indicators": 4}}
+    combo_tf = {"trend": "1h", "entry": "15m", "levels": "1d"}
+    assert "💡" in build_entry_message("LTCUSDT", "fast", combo_tf, result)
+    assert "💡" not in build_exit_message("LTCUSDT", "fast", result)
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

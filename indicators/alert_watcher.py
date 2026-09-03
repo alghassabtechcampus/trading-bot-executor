@@ -185,6 +185,24 @@ def build_log_record(symbol: str, combo_name: str, combo_tf: dict, result: dict,
     }
 
 
+def build_trail_hint(tz: dict) -> str:
+    """One advisory line for the entry message. Purely informational: nothing
+    tracks whether the reader acts on it, and no alert is ever sent about it
+    later. `arm` is the price at which the suggestion becomes relevant; `then`
+    is what the trailing rule would give AT that moment (highest price so far
+    would be `arm`, minus trail_atr_mult x ATR) -- a concrete number beats a
+    formula the reader has to evaluate. Once price runs past `arm` the level
+    keeps rising with the high, which is why the wording says to trail off the
+    highest price seen and not to park the stop at `then` forever."""
+    entry_low, entry_high = tz["entry_zone"]
+    mid = (entry_low + entry_high) / 2
+    atr = tz["atr_value"]
+    arm = mid + tz["trail_arm_atr_mult"] * atr
+    then = arm - tz["trail_atr_mult"] * atr
+    return (f"💡 لو وصل {format_price(arm)}: فكّر تحرّك الوقف يدويًا لـ"
+            f"(أعلى سعر وصله − {format_price(tz['trail_atr_mult'] * atr)}) ≈ {format_price(then)}")
+
+
 def build_entry_message(symbol: str, combo_name: str, combo_tf: dict, result: dict) -> str:
     """Only ever called for result["trade_zone"]["setup"] == "long" -- the
     exact condition the dashboard uses to show a suggested entry zone.
@@ -196,7 +214,8 @@ def build_entry_message(symbol: str, combo_name: str, combo_tf: dict, result: di
         f"🟢 {symbol} — فرصة شراء جديدة [نوع: {combo_name} | اتجاه {combo_tf['trend']} + دخول {combo_tf['entry']}]\n"
         f"التوافق: {format_split(conf)}\n"
         f"دخول {format_price(entry_low)}-{format_price(entry_high)} / "
-        f"وقف {format_price(tz['stop_loss'])} / هدف {format_price(tz['target'])}"
+        f"وقف {format_price(tz['stop_loss'])} / هدف {format_price(tz['target'])}\n"
+        f"{build_trail_hint(tz)}"
     )
 
 
