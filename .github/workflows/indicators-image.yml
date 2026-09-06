@@ -54,11 +54,25 @@ jobs:
         env:
           WEBHOOK: ${{ secrets.DOKPLOY_DEPLOY_WEBHOOK }}
         run: |
+          # Never echo $WEBHOOK: it carries its own auth token in the path.
+          # Only its length and scheme are reported, which is enough to tell a
+          # missing secret from a malformed one without leaking it.
+          WEBHOOK="$(printf '%s' "$WEBHOOK" | tr -d '[:space:]')"
           if [ -z "$WEBHOOK" ]; then
             echo "::warning title=Dokploy was NOT notified::The image is on GHCR but no redeploy was triggered, so the server is still running the previous image. Set the DOKPLOY_DEPLOY_WEBHOOK repository secret, or deploy manually in Dokploy."
             exit 0
           fi
-          code=$(curl -sS -X POST -o response.txt -w '%{http_code}' "$WEBHOOK")
+          case "$WEBHOOK" in
+            https://*|http://*) ;;
+            *)
+              echo "::error title=Dokploy webhook is not a URL::DOKPLOY_DEPLOY_WEBHOOK does not start with http(s):// (${#WEBHOOK} chars after trimming whitespace). It must be the FULL deploy URL copied from the Dokploy application's Deployments tab, with no surrounding quotes. The new image is on GHCR but the server is still on the old one."
+              exit 1 ;;
+          esac
+          if ! code=$(curl -sS -X POST -o response.txt -w '%{http_code}' --max-time 60 "$WEBHOOK"); then
+            rc=$?
+            echo "::error title=Dokploy webhook unreachable::curl failed with exit $rc before getting a response (3=malformed URL, 6=DNS, 7=refused, 28=timeout, 60=TLS). The new image is on GHCR but the server is still on the old one."
+            exit 1
+          fi
           echo "Dokploy responded HTTP $code"
           cat response.txt || true
           echo
