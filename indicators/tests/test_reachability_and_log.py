@@ -67,9 +67,17 @@ def test_price_inside_or_below_zone_is_always_reachable():
 
 
 def test_unreachable_never_reaches_the_entry_alert_path():
-    """alert_watcher fires an entry alert on setup == "long" and nothing
-    else, so an unreachable setup cannot produce one -- and if a live long
-    turns unreachable, that is an EXIT, never a new buy."""
+    """alert_watcher fires an entry alert on setup == "long" and nothing else,
+    so an unreachable setup cannot produce one.
+
+    The second half of this test used to assert the opposite of what it
+    asserts now: a live long turning unreachable was an EXIT. That was
+    measured to be wrong in practice -- the long/unreachable line is a fixed
+    weekly level compared against a live price, so price crosses it several
+    times a day and each crossing sent an exit the trade had not actually
+    made. The pair is now one alert state (ALERT_EQUIVALENT_SETUPS), so this
+    direction is silent too; see test_long_unreachable_long_is_completely_silent.
+    """
     from indicators.alert_watcher import process_one
 
     combo_tf = {"trend": "1d", "entry": "4h", "levels": "1w"}
@@ -88,7 +96,7 @@ def test_unreachable_never_reaches_the_entry_alert_path():
                         "pending_count": 0, "last_checked_at": "t0"}}
     fired = [a for a in (process_one("X", "slow", combo_tf, result, state, f"t{i}")
                          for i in range(1, 5)) if a]
-    assert len(fired) == 1 and fired[0]["type"] == "exit"
+    assert fired == []
 
 
 def test_alert_log_is_append_only(tmp_path, monkeypatch):
@@ -190,6 +198,125 @@ def test_entry_message_carries_the_hint_and_exit_message_does_not():
     combo_tf = {"trend": "1h", "entry": "15m", "levels": "1d"}
     assert "💡" in build_entry_message("LTCUSDT", "fast", combo_tf, result)
     assert "💡" not in build_exit_message("LTCUSDT", "fast", result)
+
+
+
+# --------------------------------------------------------------------------
+# "long" and "unreachable" are ONE alert state
+#
+# The pair is separated by a fixed weekly support level compared against a
+# live price, so price crosses the line several times a day with nothing
+# about the trade having changed. Replaying 30 days of real LTCUSDT 15m data
+# through the engine produced 11 raw long<->unreachable flips on the slow
+# combo, each of which used to become a confirmed EXIT or ENTRY message.
+# --------------------------------------------------------------------------
+
+COMBO_TF = {"trend": "1d", "entry": "4h", "levels": "1w"}
+BULLISH_CONF = {"direction": "bullish", "bullish_count": 3, "bearish_count": 1,
+                "total_indicators": 4}
+
+
+def _result(distance_pct: float, conf: dict | None = None) -> dict:
+    return {"trade_zone": trade_zone.compute("bullish", PRICE, zone_at(distance_pct), ATR,
+                                             max_entry_distance_pct=3.0),
+            "confluence": conf or BULLISH_CONF}
+
+
+def _run(sequence, state):
+    """Feeds a sequence of results through process_one and returns every alert
+    that fired, in order."""
+    from indicators.alert_watcher import process_one
+    out = []
+    for i, res in enumerate(sequence):
+        a = process_one("X", "slow", COMBO_TF, res, state, f"t{i}")
+        if a:
+            out.append(a)
+    return out
+
+
+def test_long_unreachable_long_is_completely_silent():
+    """The decided rule: a round trip long -> unreachable -> long fires NO
+    alert of any kind, in either direction, no matter how long it dwells on
+    either side or how many times it flips."""
+    near, far = _result(1.0), _result(10.6)
+    assert near["trade_zone"]["setup"] == "long"
+    assert far["trade_zone"]["setup"] == "unreachable"
+
+    state = {"X|slow": {"confirmed_setup": "long", "pending_setup": None,
+                        "pending_count": 0, "last_checked_at": "t0"}}
+
+    # one slow round trip, dwelling well past CONFIRMATIONS_REQUIRED on each side
+    assert _run([far] * 5 + [near] * 5, state) == []
+    # and rapid flapping, which is what actually happens on the live feed
+    assert _run([far, near] * 10, state) == []
+    # the state never left the single "long" alert state
+    assert state["X|slow"]["confirmed_setup"] == "long"
+
+
+def test_real_direction_changes_still_alert_exactly_as_before():
+    """Only the long/unreachable pair is collapsed. A genuine loss of bullish
+    confluence must still produce one EXIT, and its return one ENTRY."""
+    near = _result(1.0)
+    neutral = {"trade_zone": trade_zone.compute("neutral", PRICE, zone_at(1.0), ATR),
+               "confluence": {"direction": "neutral", "bullish_count": 2,
+                              "bearish_count": 2, "total_indicators": 4}}
+    bearish = {"trade_zone": trade_zone.compute("bearish", PRICE, zone_at(1.0), ATR),
+               "confluence": {"direction": "bearish", "bullish_count": 1,
+                              "bearish_count": 3, "total_indicators": 4}}
+    assert neutral["trade_zone"]["setup"] == "none"
+    assert bearish["trade_zone"]["setup"] == "bearish_no_short"
+
+    state = {"X|slow": {"confirmed_setup": "long", "pending_setup": None,
+                        "pending_count": 0, "last_checked_at": "t0"}}
+    fired = _run([neutral] * 3, state)
+    assert [a["type"] for a in fired] == ["exit"]
+
+    fired = _run([near] * 3, state)
+    assert [a["type"] for a in fired] == ["entry"]
+
+    # long -> bearish is still an exit too
+    fired = _run([bearish] * 3, state)
+    assert [a["type"] for a in fired] == ["exit"]
+
+
+def test_becoming_bullish_while_out_of_reach_does_not_swallow_the_entry():
+    """Collapsing the pair must not lose a real entry: if the setup turns
+    bullish while the zone is still too far to quote, the candidate stays
+    pending and the ENTRY fires on the first check where it is in reach --
+    once, not once per crossing."""
+    far, near = _result(10.6), _result(1.0)
+    state = {"X|slow": {"confirmed_setup": "none", "pending_setup": None,
+                        "pending_count": 0, "last_checked_at": "t0"}}
+
+    assert _run([far] * 6, state) == []            # nothing quotable yet -> silence
+    fired = _run([near], state)                     # in reach -> the entry it owed
+    assert [a["type"] for a in fired] == ["entry"]
+    assert "وقف" in fired[0]["text"] and "هدف" in fired[0]["text"]
+    assert _run([far] * 4 + [near] * 4, state) == []  # and silent from then on
+
+
+def test_entry_alert_is_never_built_from_an_unquotable_zone():
+    """An 'unreachable' trade_zone carries no stop_loss/target/atr_value, so
+    building an entry message from one would raise. No sequence may reach
+    that path."""
+    far = _result(10.6)
+    assert "stop_loss" not in far["trade_zone"]
+
+    for baseline in ("none", "bearish_no_short", "long", "unreachable"):
+        state = {"X|slow": {"confirmed_setup": baseline, "pending_setup": None,
+                            "pending_count": 0, "last_checked_at": "t0"}}
+        for a in _run([far] * 8, state):
+            assert a["type"] != "entry", (baseline, a)
+
+
+def test_state_file_written_before_this_rule_upgrades_silently():
+    """A live alert_state.json still holds literal 'unreachable' values. The
+    first check after deploying must not read that as a state change."""
+    near = _result(1.0)
+    state = {"X|slow": {"confirmed_setup": "unreachable", "pending_setup": None,
+                        "pending_count": 0, "last_checked_at": "t0"}}
+    assert _run([near] * 4, state) == []
+    assert state["X|slow"]["confirmed_setup"] == "long"
 
 
 if __name__ == "__main__":

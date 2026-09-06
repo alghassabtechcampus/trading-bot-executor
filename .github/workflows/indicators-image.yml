@@ -37,3 +37,32 @@ jobs:
           file: ./indicators/Dockerfile
           push: true
           tags: ghcr.io/${{ github.repository }}/indicators-dashboard:latest
+
+      # Pushing to GHCR is NOT a deploy. A running container keeps whatever
+      # image it pulled at its last deploy -- moving the :latest tag does not
+      # restart or re-pull anything. Until this step existed every release
+      # needed a manual "Deploy" click in Dokploy, and forgetting it left the
+      # server silently running old code: that is exactly what happened to
+      # commit 47ed5eb, whose image sat correct-but-unused on GHCR for three
+      # days while the alerts kept coming from the previous build.
+      #
+      # DOKPLOY_DEPLOY_WEBHOOK is the per-application deploy URL Dokploy
+      # generates (application -> Deployments -> Webhook URL); it carries its
+      # own token in the path, so no other credential is needed. A POST to it
+      # makes Dokploy pull :latest and recreate the container.
+      - name: Trigger Dokploy redeploy
+        env:
+          WEBHOOK: ${{ secrets.DOKPLOY_DEPLOY_WEBHOOK }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "::warning title=Dokploy was NOT notified::The image is on GHCR but no redeploy was triggered, so the server is still running the previous image. Set the DOKPLOY_DEPLOY_WEBHOOK repository secret, or deploy manually in Dokploy."
+            exit 0
+          fi
+          code=$(curl -sS -X POST -o response.txt -w '%{http_code}' "$WEBHOOK")
+          echo "Dokploy responded HTTP $code"
+          cat response.txt || true
+          echo
+          if [ "$code" -lt 200 ] || [ "$code" -ge 300 ]; then
+            echo "::error title=Dokploy redeploy failed::POST to the deploy webhook returned HTTP $code. The new image is on GHCR but the server is still on the old one."
+            exit 1
+          fi

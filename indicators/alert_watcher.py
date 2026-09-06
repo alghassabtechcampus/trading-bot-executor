@@ -45,6 +45,8 @@ Alert-worthy transitions (confirmed_setup before -> after, on confirmation):
   "long"   -> anything else    : EXIT alert (long opportunity ended)
   "none" <-> "bearish_no_short": tracked in state, no alert by default
     (see ALERT_ON_BEARISH_NO_SHORT below -- flip it if that's wanted later)
+  "long" <-> "unreachable"     : NOT a transition at all. The two are one
+    single state to this module -- see ALERT_EQUIVALENT_SETUPS.
 """
 
 from __future__ import annotations
@@ -81,6 +83,26 @@ COMBOS: dict[str, dict[str, str]] = {
 
 CONFIRMATIONS_REQUIRED = 2       # consecutive checks a new setup must survive before alerting
 ALERT_ON_BEARISH_NO_SHORT = False  # per the brief's default -- flip to True to also alert on that transition
+
+# "unreachable" is the SAME bullish opportunity as "long": same direction,
+# same entry zone, same weekly support behind it -- the only difference is
+# that price is currently more than entry_max_distance_pct above the zone.
+# trade_zone keeps them apart so the DASHBOARD can grey an out-of-reach zone
+# out; the alert state machine deliberately does not, because the line
+# between them is a fixed weekly level compared against a live price, and
+# price walks back and forth across that line without one thing about the
+# trade having changed. Treating the pair as two states made every such
+# wobble a confirmed "long -> unreachable" EXIT followed by an
+# "unreachable -> long" ENTRY. Collapsing them here is what stops that from
+# reaching Telegram; every other transition keeps its previous behaviour.
+ALERT_EQUIVALENT_SETUPS = {"unreachable": "long"}
+
+
+def alert_state_of(setup: str) -> str:
+    """The setup as the ALERT state machine sees it. Only alerting collapses
+    the pair -- the dashboard, the log record and the message builders all
+    keep reading the raw trade_zone["setup"]."""
+    return ALERT_EQUIVALENT_SETUPS.get(setup, setup)
 
 
 class _RunCache(DataSource):
@@ -235,9 +257,14 @@ def build_exit_message(symbol: str, combo_name: str, result: dict) -> str:
 def process_one(symbol: str, combo_name: str, combo_tf: dict, result: dict, state: dict,
                  checked_at: str) -> dict | None:
     """Updates `state` in place for this (symbol, combo) key and returns an
-    alert dict if (and only if) a confirmed transition just fired."""
+    alert dict if (and only if) a confirmed transition just fired.
+
+    Runs on alert_state_of(setup), not on the raw setup, so "long" and
+    "unreachable" are one indistinguishable state here and no flip between
+    them can produce an alert in either direction."""
     key = f"{symbol}|{combo_name}"
-    new_setup = result["trade_zone"]["setup"]
+    raw_setup = result["trade_zone"]["setup"]
+    new_setup = alert_state_of(raw_setup)
     prev = state.get(key)
 
     if prev is None:
@@ -247,8 +274,12 @@ def process_one(symbol: str, combo_name: str, combo_tf: dict, result: dict, stat
                       "pending_count": 0, "last_checked_at": checked_at}
         return None
 
-    confirmed = prev["confirmed_setup"]
+    # Mapped on read as well as on write: a state file written before this
+    # rule existed can still hold a literal "unreachable", and it must not
+    # read back as a state change on the first check after the upgrade.
+    confirmed = alert_state_of(prev["confirmed_setup"])
     pending = prev.get("pending_setup")
+    pending = alert_state_of(pending) if pending is not None else None
     pending_count = prev.get("pending_count", 0)
     alert = None
 
@@ -256,7 +287,14 @@ def process_one(symbol: str, combo_name: str, combo_tf: dict, result: dict, stat
         pending, pending_count = None, 0  # reverted back to the established state -- noise, drop any candidate
     elif new_setup == pending:
         pending_count += 1
-        if pending_count >= CONFIRMATIONS_REQUIRED:
+        # Confirming INTO "long" needs a zone that can actually be quoted:
+        # while the raw setup is still "unreachable" there is no stop_loss or
+        # target to put in the message. Such a candidate stays pending --
+        # pending_count keeps climbing, this is not a revert -- so the entry
+        # alert fires on the first check where the zone is back in reach,
+        # instead of the state confirming silently and swallowing it for good.
+        quotable = new_setup != "long" or raw_setup == "long"
+        if pending_count >= CONFIRMATIONS_REQUIRED and quotable:
             if new_setup == "long":
                 text = build_entry_message(symbol, combo_name, combo_tf, result)
                 alert = {"symbol": symbol, "combo": combo_name, "type": "entry", "text": text}
