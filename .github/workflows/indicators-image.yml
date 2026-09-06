@@ -11,7 +11,11 @@ name: Build and push indicators image
 on:
   push:
     branches: [strategy-d-mean-reversion]
-    paths: ["indicators/**"]
+    # The workflow itself is in the filter on purpose: it now carries the
+    # DEPLOY step, and a change to that step has to be able to rebuild and
+    # re-run itself. Without this a broken deploy could only be retested by
+    # making an unrelated edit under indicators/.
+    paths: ["indicators/**", ".github/workflows/indicators-image.yml"]
   workflow_dispatch: {}
 
 jobs:
