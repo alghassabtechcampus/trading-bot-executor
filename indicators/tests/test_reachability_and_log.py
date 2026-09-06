@@ -319,6 +319,141 @@ def test_state_file_written_before_this_rule_upgrades_silently():
     assert state["X|slow"]["confirmed_setup"] == "long"
 
 
+# --------------------------------------------------------------------------
+# R:R guard -- "poor_rr"
+#
+# The target is the nearest resistance above price, and nothing stops it
+# sitting just above the support the entry zone is built on while the stop is
+# a full 1.0xATR below it. Real alerts went out at R:R 0.2 and 0.6: a "buy"
+# whose win is smaller than its loss. Replaying 30 days of real LTCUSDT
+# history, 47.7% of SLOW-combo long readings are under 1.5 (median 1.84),
+# against 14.6% on medium and 2.7% on fast.
+# --------------------------------------------------------------------------
+
+MIN_RR = 1.5
+
+
+def zone_with_rr(rr: float, distance_pct: float = 0.1) -> dict:
+    """A support/resistance pair whose resulting R:R is exactly `rr`. With the
+    default stop_atr_mult=1.0 the risk is exactly ATR, so placing the
+    resistance rr x ATR above the support gives that ratio directly."""
+    entry_high = PRICE * (1 - distance_pct / 100)
+    support = entry_high / 1.003
+    return {"nearest_support": support, "nearest_resistance": support + rr * ATR}
+
+
+def _tz(rr: float) -> dict:
+    return trade_zone.compute("bullish", PRICE, zone_with_rr(rr), ATR,
+                              max_entry_distance_pct=3.0, min_rr_ratio=MIN_RR)
+
+
+def test_close_resistance_becomes_poor_rr_not_long():
+    """The reported pathology: R:R 0.2 and 0.6 were quoted as buy alerts."""
+    for rr in (0.2, 0.6, 0.98, 1.49):
+        tz = _tz(rr)
+        assert tz["setup"] == "poor_rr", (rr, tz["setup"])
+        assert tz["rr_ratio"] == round(rr, 2)
+        assert tz["min_rr_ratio"] == MIN_RR
+        assert "message" in tz
+
+
+def test_adequate_rr_still_produces_a_long():
+    for rr in (1.5, 2.0, 6.0):
+        tz = _tz(rr)
+        assert tz["setup"] == "long", (rr, tz["setup"])
+        assert tz["rr_ratio"] == round(rr, 2)
+
+
+def test_rr_threshold_is_a_boundary_not_a_range():
+    """>= the minimum passes, < it does not -- no dead band in between."""
+    assert _tz(MIN_RR)["setup"] == "long"
+    assert _tz(MIN_RR - 0.01)["setup"] == "poor_rr"
+
+
+def test_rr_threshold_is_configurable():
+    sr = zone_with_rr(2.5)
+    assert trade_zone.compute("bullish", PRICE, sr, ATR, min_rr_ratio=1.5)["setup"] == "long"
+    assert trade_zone.compute("bullish", PRICE, sr, ATR, min_rr_ratio=3.0)["setup"] == "poor_rr"
+
+
+def test_target_at_or_below_entry_is_poor_rr_not_a_blank_long():
+    """rr_ratio is None when the nearest resistance sits at or under the
+    support the zone is built on. That used to return setup 'long' with an
+    empty R:R -- the worst case of all, quoted as buyable."""
+    tz = trade_zone.compute("bullish", PRICE, zone_with_rr(-0.5), ATR, min_rr_ratio=MIN_RR)
+    assert tz["setup"] == "poor_rr"
+    assert tz["rr_ratio"] is None
+
+
+def test_poor_rr_carries_no_trailing_advice():
+    """The trail hint is part of an actionable entry; a setup we refuse to
+    propose must not carry one."""
+    tz = _tz(0.6)
+    for field in ("trail_arm_atr_mult", "trail_atr_mult", "atr_value"):
+        assert field not in tz
+
+
+def _result_rr(rr: float, conf: dict | None = None) -> dict:
+    return {"trade_zone": _tz(rr), "confluence": conf or BULLISH_CONF}
+
+
+def test_poor_rr_never_fires_an_entry_alert():
+    """No baseline state and no amount of repetition may turn a poor-R:R
+    reading into a buy message."""
+    weak = _result_rr(0.6)
+    for baseline in ("none", "bearish_no_short", "long", "unreachable", "poor_rr"):
+        state = {"X|slow": {"confirmed_setup": baseline, "pending_setup": None,
+                            "pending_count": 0, "last_checked_at": "t0"}}
+        for a in _run([weak] * 8, state):
+            assert a["type"] != "entry", (baseline, a)
+
+
+def test_poor_rr_and_long_are_one_alert_state():
+    """long -> poor_rr -> long is silent in both directions, like
+    long <-> unreachable."""
+    good, weak = _result_rr(6.0), _result_rr(0.6)
+    state = {"X|slow": {"confirmed_setup": "long", "pending_setup": None,
+                        "pending_count": 0, "last_checked_at": "t0"}}
+    assert _run([weak] * 5 + [good] * 5, state) == []
+    assert _run([weak, good] * 10, state) == []
+    assert state["X|slow"]["confirmed_setup"] == "long"
+
+
+def test_poor_rr_does_not_exit_an_open_long():
+    """The decision NOT to map poor_rr onto 'none': an open trade's stop and
+    target have not moved just because a hypothetical re-entry now scores
+    worse, so no exit is sent. A real loss of the bullish read still exits."""
+    weak = _result_rr(0.6)
+    neutral = {"trade_zone": trade_zone.compute("neutral", PRICE, zone_with_rr(6.0), ATR),
+               "confluence": {"direction": "neutral", "bullish_count": 2,
+                              "bearish_count": 2, "total_indicators": 4}}
+    state = {"X|slow": {"confirmed_setup": "long", "pending_setup": None,
+                        "pending_count": 0, "last_checked_at": "t0"}}
+    assert _run([weak] * 6, state) == []                     # R:R decayed -> silence
+    fired = _run([neutral] * 3, state)                       # confluence actually lost
+    assert [a["type"] for a in fired] == ["exit"]
+
+
+def test_becoming_bullish_with_poor_rr_does_not_swallow_the_entry():
+    """Turning bullish while the reward is too small holds the candidate
+    pending, so the entry fires once when the R:R becomes acceptable."""
+    weak, good = _result_rr(0.6), _result_rr(6.0)
+    state = {"X|slow": {"confirmed_setup": "none", "pending_setup": None,
+                        "pending_count": 0, "last_checked_at": "t0"}}
+    assert _run([weak] * 6, state) == []
+    fired = _run([good], state)
+    assert [a["type"] for a in fired] == ["entry"]
+    assert _run([weak] * 4 + [good] * 4, state) == []
+
+
+def test_state_file_holding_poor_rr_upgrades_silently():
+    good = _result_rr(6.0)
+    state = {"X|slow": {"confirmed_setup": "poor_rr", "pending_setup": None,
+                        "pending_count": 0, "last_checked_at": "t0"}}
+    assert _run([good] * 4, state) == []
+    assert state["X|slow"]["confirmed_setup"] == "long"
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

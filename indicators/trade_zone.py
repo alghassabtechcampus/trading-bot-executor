@@ -38,6 +38,20 @@ Such a setup is reported (with the distance, so the dashboard can explain
 itself) but never packaged as an actionable entry, and alert_watcher.py
 never fires a buy alert on it -- it only ever alerts on setup == "long".
 
+R:R guard: a bullish read whose reward does not justify its risk returns
+setup "poor_rr" instead of "long". The target is the nearest resistance
+above price, and nothing stops that resistance sitting just above the
+support the entry zone is built on, while the stop is a full 1.0xATR
+below it -- which quotes a "buy" whose win is smaller than its loss. Real
+LTCUSDT alerts went out at R:R 0.2 and 0.6. Replaying 30 days of real
+history shows this is overwhelmingly a SLOW-combo problem: 47.7% of its
+long readings are under 1.5 (median 1.84, tenth percentile 0.26), against
+14.6% on medium and 2.7% on fast, because levels=1w can put a weekly
+resistance immediately above a weekly support while ATR(4h) keeps the
+stop wide. Like "unreachable" this is reported with its numbers so the
+dashboard can explain itself, and like "unreachable" alert_watcher.py
+never fires a buy alert on it.
+
 TRAILING NOTE (advisory numbers only, no behaviour attached). A "long"
 also carries trail_arm_atr_mult / trail_atr_mult / atr_value. These are
 NOT used by anything here: the stop, target and setup are computed
@@ -67,6 +81,12 @@ UNREACHABLE_MESSAGE_TEMPLATE = (
     "الفرصة دي غير قابلة للتنفيذ عمليًا عند السعر الحالي، فمفيش اقتراح دخول عليها."
 )
 
+POOR_RR_MESSAGE_TEMPLATE = (
+    "الاتجاه صاعد وفق توافق المؤشرات، لكن أقرب مقاومة قريبة جدًا من نطاق الدخول: "
+    "نسبة العائد للمخاطرة {rr} — أقل من الحد الأدنى ({limit:.1f}). "
+    "يعني حتى لو الصفقة نجحت، الربح أصغر من المبلغ المخاطر به، فمفيش اقتراح دخول عليها."
+)
+
 BEARISH_NO_SHORT_MESSAGE = (
     "الاتجاه هابط حاليًا وفق توافق المؤشرات، لكن هذا الداشبورد لا يقترح صفقات بيع (short) "
     "لاعتبارات شرعية. لو عندك مركز شراء مفتوح على هذا الزوج، هذا الاتجاه يستحق المراجعة "
@@ -76,7 +96,7 @@ BEARISH_NO_SHORT_MESSAGE = (
 
 def compute(direction: str, current_price: float, sr: dict, atr_value: float | None,
             stop_atr_mult: float = 1.0, target_atr_mult: float = 2.0, entry_zone_pct: float = 0.3,
-            max_entry_distance_pct: float = 3.0,
+            max_entry_distance_pct: float = 3.0, min_rr_ratio: float = 1.5,
             trail_arm_atr_mult: float = 0.5, trail_atr_mult: float = 1.0) -> dict:
     if direction == "neutral":
         return {"setup": "none", "direction": "neutral", "reason": "no clear confluence direction"}
@@ -119,6 +139,29 @@ def compute(direction: str, current_price: float, sr: dict, atr_value: float | N
 
     rr_ratio = reward / risk if reward > 0 else None
 
+    # Quality guard, the same shape as the reachability one above: a bullish
+    # read whose target sits too close to the entry relative to the stop is
+    # reported but never packaged as an actionable entry. rr_ratio is None
+    # when the "target" is at or BELOW the entry reference (nearest
+    # resistance under the support the zone is built on) -- that is the worst
+    # case of all, so it fails the guard rather than slipping through as a
+    # long with a blank R:R, which is what used to happen.
+    if rr_ratio is None or rr_ratio < min_rr_ratio:
+        return {
+            "setup": "poor_rr",
+            "direction": "bullish",
+            "reason": "reward too small relative to risk",
+            "entry_zone": [round(entry_low, 8), round(entry_high, 8)],
+            "entry_distance_pct": round(entry_distance_pct, 4),
+            "stop_loss": round(stop, 8),
+            "target": round(target, 8),
+            "rr_ratio": round(rr_ratio, 2) if rr_ratio is not None else None,
+            "min_rr_ratio": min_rr_ratio,
+            "message": POOR_RR_MESSAGE_TEMPLATE.format(
+                rr=f"{rr_ratio:.2f}" if rr_ratio is not None else "أقل من صفر",
+                limit=min_rr_ratio),
+        }
+
     return {
         "setup": "long",
         "direction": "bullish",
@@ -142,4 +185,5 @@ def compute(direction: str, current_price: float, sr: dict, atr_value: float | N
     }
 
 
-__all__ = ["compute", "BEARISH_NO_SHORT_MESSAGE", "UNREACHABLE_MESSAGE_TEMPLATE"]
+__all__ = ["compute", "BEARISH_NO_SHORT_MESSAGE", "UNREACHABLE_MESSAGE_TEMPLATE",
+           "POOR_RR_MESSAGE_TEMPLATE"]

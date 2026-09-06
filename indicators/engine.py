@@ -58,6 +58,7 @@ def compute_symbol(symbol: str, config: DashboardConfig, source: DataSource) -> 
         stop_atr_mult=config.stop_atr_mult, target_atr_mult=config.target_atr_mult,
         entry_zone_pct=config.entry_zone_pct,
         max_entry_distance_pct=config.entry_max_distance_pct,
+        min_rr_ratio=config.min_rr_ratio,
     )
 
     return {

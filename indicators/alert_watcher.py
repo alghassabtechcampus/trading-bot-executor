@@ -45,8 +45,10 @@ Alert-worthy transitions (confirmed_setup before -> after, on confirmation):
   "long"   -> anything else    : EXIT alert (long opportunity ended)
   "none" <-> "bearish_no_short": tracked in state, no alert by default
     (see ALERT_ON_BEARISH_NO_SHORT below -- flip it if that's wanted later)
-  "long" <-> "unreachable"     : NOT a transition at all. The two are one
-    single state to this module -- see ALERT_EQUIVALENT_SETUPS.
+  "long" <-> "unreachable"     : NOT a transition at all. All three are one
+  "long" <-> "poor_rr"           single state to this module, and an ENTRY
+    alert is only ever sent while the raw setup is "long" -- see
+    ALERT_EQUIVALENT_SETUPS.
 """
 
 from __future__ import annotations
@@ -84,24 +86,33 @@ COMBOS: dict[str, dict[str, str]] = {
 CONFIRMATIONS_REQUIRED = 2       # consecutive checks a new setup must survive before alerting
 ALERT_ON_BEARISH_NO_SHORT = False  # per the brief's default -- flip to True to also alert on that transition
 
-# "unreachable" is the SAME bullish opportunity as "long": same direction,
-# same entry zone, same weekly support behind it -- the only difference is
-# that price is currently more than entry_max_distance_pct above the zone.
-# trade_zone keeps them apart so the DASHBOARD can grey an out-of-reach zone
-# out; the alert state machine deliberately does not, because the line
-# between them is a fixed weekly level compared against a live price, and
-# price walks back and forth across that line without one thing about the
-# trade having changed. Treating the pair as two states made every such
-# wobble a confirmed "long -> unreachable" EXIT followed by an
-# "unreachable -> long" ENTRY. Collapsing them here is what stops that from
-# reaching Telegram; every other transition keeps its previous behaviour.
-ALERT_EQUIVALENT_SETUPS = {"unreachable": "long"}
+# "unreachable" and "poor_rr" are the SAME bullish opportunity as "long":
+# same direction, same support, same entry zone. Each is "long, but not worth
+# announcing right now" for a different reason -- price is too far above the
+# zone, or the nearest resistance is too close for the reward to justify the
+# stop. trade_zone keeps all three apart so the DASHBOARD can explain which
+# it is; the alert state machine deliberately does not.
+#
+# Why they are collapsed rather than treated as their own states: what
+# separates them from "long" is a threshold crossing, not a change of view.
+# Price walks back and forth across the reachability line several times a
+# day, and R:R crosses the minimum whenever ATR breathes or a level is
+# re-detected -- while the trade being described is identical throughout.
+# Treating them as distinct states made each wobble a confirmed EXIT
+# followed by a fresh ENTRY.
+#
+# In particular they are NOT mapped to "none". Mapping them there would fire
+# an EXIT the moment an open trade's hypothetical re-entry scored worse,
+# telling the reader an opportunity ended when their stop and target had not
+# moved at all. A real loss of the bullish read still exits, because that is
+# a genuine "none"/"bearish_no_short" transition and is untouched here.
+ALERT_EQUIVALENT_SETUPS = {"unreachable": "long", "poor_rr": "long"}
 
 
 def alert_state_of(setup: str) -> str:
     """The setup as the ALERT state machine sees it. Only alerting collapses
-    the pair -- the dashboard, the log record and the message builders all
-    keep reading the raw trade_zone["setup"]."""
+    these -- the dashboard, the log record and the message builders all keep
+    reading the raw trade_zone["setup"]."""
     return ALERT_EQUIVALENT_SETUPS.get(setup, setup)
 
 
@@ -287,14 +298,16 @@ def process_one(symbol: str, combo_name: str, combo_tf: dict, result: dict, stat
         pending, pending_count = None, 0  # reverted back to the established state -- noise, drop any candidate
     elif new_setup == pending:
         pending_count += 1
-        # Confirming INTO "long" needs a zone that can actually be quoted:
-        # while the raw setup is still "unreachable" there is no stop_loss or
-        # target to put in the message. Such a candidate stays pending --
-        # pending_count keeps climbing, this is not a revert -- so the entry
-        # alert fires on the first check where the zone is back in reach,
-        # instead of the state confirming silently and swallowing it for good.
-        quotable = new_setup != "long" or raw_setup == "long"
-        if pending_count >= CONFIRMATIONS_REQUIRED and quotable:
+        # Confirming INTO "long" requires the RAW setup to be an actionable
+        # long, not merely a member of the collapsed group: "unreachable"
+        # carries no stop_loss or target to put in the message, and "poor_rr"
+        # carries numbers we have decided are not worth acting on. Such a
+        # candidate stays pending -- pending_count keeps climbing, this is not
+        # a revert -- so the entry alert fires on the first check where the
+        # setup is genuinely actionable, instead of the state confirming
+        # silently and swallowing that entry for good.
+        announceable = new_setup != "long" or raw_setup == "long"
+        if pending_count >= CONFIRMATIONS_REQUIRED and announceable:
             if new_setup == "long":
                 text = build_entry_message(symbol, combo_name, combo_tf, result)
                 alert = {"symbol": symbol, "combo": combo_name, "type": "entry", "text": text}
