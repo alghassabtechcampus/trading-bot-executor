@@ -28,6 +28,20 @@ ENV INDICATORS_DATA_DIR=/data
 RUN mkdir -p /data
 VOLUME ["/data"]
 
+# Build stamp, so /api/version can say WHICH code is actually serving.
+# Deliberately the last thing in the file: these change on every build, and
+# anything below an invalidated layer rebuilds too -- down here they only
+# ever invalidate themselves, not the pip install or the source copy.
+# Values come from .github/workflows/indicators-image.yml; the defaults keep
+# a plain local `docker build` working and honestly labelled "unknown".
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=unknown
+ENV GIT_COMMIT=$GIT_COMMIT
+ENV BUILD_TIME=$BUILD_TIME
+LABEL org.opencontainers.image.revision=$GIT_COMMIT \
+      org.opencontainers.image.created=$BUILD_TIME \
+      org.opencontainers.image.source=https://github.com/alghassabtechcampus/trading-bot-executor
+
 EXPOSE 5050
 
 CMD ["gunicorn", "--bind", "0.0.0.0:5050", "--workers", "2", "--timeout", "60", "indicators.web:app"]

@@ -28,6 +28,11 @@ Routes:
                                   in-process per (symbol, trend, entry,
                                   levels) for COMPUTE_CACHE_TTL_SECONDS so
                                   rapid dropdown changes don't hammer Bybit.
+  GET /api/check_alerts       -> runs one alert_watcher check and returns
+                                  the alerts it fired (state-updating)
+  GET /api/version            -> which build is actually serving: the git
+                                  SHA and time baked in at docker build,
+                                  plus the min_rr_ratio in effect right now
 """
 
 from __future__ import annotations
@@ -181,6 +186,42 @@ def api_check_alerts() -> Response:
         return jsonify({"error": str(exc), "alerts": []}), 502
 
     resp = jsonify({"checked_at": time.time(), "count": len(alerts), "alerts": alerts})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/version")
+def api_version() -> Response:
+    """Which code is actually serving, answerable in one curl.
+
+    Exists because "the image is on GHCR" and "the server is running it" are
+    different facts, and confusing them cost three days once: commit 47ed5eb
+    sat built-and-correct in the registry while the container kept serving
+    the previous build, and the only way anyone noticed was that a feature
+    was missing from Telegram messages. GIT_COMMIT/BUILD_TIME are baked in
+    by the Dockerfile at build time; they read "unknown" outside a built
+    image (a local `flask run`, a plain `docker build` with no build-args),
+    which is the honest answer rather than a guess.
+
+    min_rr_ratio is read through load_config() on every request, not cached,
+    so it reflects a DASHBOARD_MIN_RR_RATIO environment override actually in
+    effect in this container -- the point is to confirm the running
+    threshold, and a value baked at import time could not do that.
+
+    Deliberately carries nothing else: no paths, no data directory, no
+    config dump. It is unauthenticated like the rest of this read-only app,
+    so it says what is running and nothing about where or how."""
+    try:
+        min_rr = load_config().min_rr_ratio
+    except Exception as exc:                    # a broken config must not hide the SHA
+        min_rr = None
+        _alerts_logger.warning(f"/api/version could not read config: {exc}")
+
+    resp = jsonify({
+        "commit_sha": os.getenv("GIT_COMMIT") or "unknown",
+        "built_at": os.getenv("BUILD_TIME") or "unknown",
+        "min_rr_ratio": min_rr,
+    })
     resp.headers["Cache-Control"] = "no-store"
     return resp
 

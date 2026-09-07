@@ -35,12 +35,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # GitHub has no built-in "now" expression, so stamp it here and hand
+      # both values to the build. github.sha is the commit this run checked
+      # out, which is exactly what /api/version should report.
+      - name: Stamp build metadata
+        id: stamp
+        run: echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - uses: docker/build-push-action@v5
         with:
           context: ./indicators
           file: ./indicators/Dockerfile
           push: true
           tags: ghcr.io/${{ github.repository }}/indicators-dashboard:latest
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.stamp.outputs.built_at }}
 
       # Pushing to GHCR is NOT a deploy. A running container keeps whatever
       # image it pulled at its last deploy -- moving the :latest tag does not
