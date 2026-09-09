@@ -43,9 +43,21 @@ logger = logging.getLogger("indicators.bybit_live")
 BYBIT_MARKET_URL = "https://api.bybit.com"
 CATEGORY = "linear"
 BARS_TO_FETCH = 300          # generous window: covers Ichimoku's 52+26=78-bar need plus buffer
-REQUEST_TIMEOUT = 15
+# 10s, not 15: a kline response that has not arrived in 10s is not going to
+# be useful to a check that runs every 15 minutes. A timeout raises straight
+# out of _get_with_retry (only a fast 429 loops), so this is paid at most
+# once per fetch, on top of the backoff ladder below.
+REQUEST_TIMEOUT = 10
 REQUEST_DELAY_SECONDS = 0.2
-MAX_RETRIES = 5
+MAX_RETRIES = 3
+# Cap on the 429 backoff. It used to be an uncapped 2**attempt over 5 tries:
+# 2+4+8+16+32 = 62s of sleeping for ONE fetch, and a check makes 45 of them
+# in a single HTTP request. One rate-limited symbol could therefore blow the
+# whole request budget on its own. Bounded at 3 tries x <=5s, the worst a
+# single fetch can cost is ~11s of backoff, after which get_ohlcv falls back
+# to the on-disk cache and marks the reading stale -- degrading with a
+# visible warning is better here than hanging until the worker is killed.
+MAX_BACKOFF_SECONDS = 5
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 
 # Only timeframes Bybit's kline endpoint natively serves -- no client-side
@@ -73,7 +85,7 @@ class BybitLiveCryptoSource(DataSource):
         for attempt in range(1, MAX_RETRIES + 1):
             resp = requests.get(f"{BYBIT_MARKET_URL}/v5/market/kline", params=params, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 429:
-                wait = 2 ** attempt
+                wait = min(2 ** attempt, MAX_BACKOFF_SECONDS)
                 logger.warning(f"Bybit rate-limited (429) - backing off {wait}s (attempt {attempt}/{MAX_RETRIES})")
                 time.sleep(wait)
                 continue

@@ -44,4 +44,29 @@ LABEL org.opencontainers.image.revision=$GIT_COMMIT \
 
 EXPOSE 5050
 
-CMD ["gunicorn", "--bind", "0.0.0.0:5050", "--workers", "2", "--timeout", "60", "indicators.web:app"]
+# WORKER AVAILABILITY, not raw speed, is what takes this service down.
+#
+# One /api/check_alerts makes 45 sequential Bybit calls (9 symbols x 5
+# distinct timeframes), measured at ~30s from a residential IP. With the
+# unbounded 429 backoff this file's sibling sources/bybit_live.py used to
+# carry, one rate-limited fetch could sleep 62s and a whole check could run
+# for ~58 minutes. n8n calls every 15 minutes and there are 2 workers, so
+# within half an hour BOTH were occupied and every later request simply
+# queued forever -- including /api/version, which touches no network at all
+# and still hung. That is the observed failure: not a slow endpoint, a
+# service with no free worker.
+#
+# --timeout is therefore deliberately NOT generous. 120s is 4x the measured
+# cost of a real check, so honest work finishes, while anything pathological
+# is killed and its worker returned to the pool inside two minutes. Raising
+# it further (300s was considered) would have made saturation last longer,
+# not shorter. n8n's own 300s default now always fires AFTER this, so a
+# failure arrives as a readable server-side error instead of a client-side
+# abort -- which is exactly what left us guessing for two days.
+#
+# --access-logfile - puts every request and its duration in the container
+# log, so next time the evidence is in Dokploy instead of being inferred.
+CMD ["gunicorn", "--bind", "0.0.0.0:5050", "--workers", "2", \
+     "--timeout", "120", "--graceful-timeout", "30", \
+     "--access-logfile", "-", "--error-logfile", "-", \
+     "indicators.web:app"]
