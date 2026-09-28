@@ -1,0 +1,50 @@
+# Dedicated image for trade_logger.py -- deliberately SEPARATE from the root
+# Dockerfile, so the executor's deployment is not touched at all.
+#
+# WHY A SECOND DOCKERFILE INSTEAD OF REUSING THE ROOT ONE
+#
+# How Dokploy builds the executor today is not recorded anywhere in this repo
+# (there is a Procfile AND a root Dockerfile, both added 2026-06-05 and never
+# revisited, and no CI workflow builds the root image). If the executor is a
+# Dokploy Application with Build Type = Nixpacks, it reads the Procfile and
+# IGNORES the root Dockerfile entirely -- so edits there would silently do
+# nothing. Pointing a second Dokploy Application at THIS file works either
+# way, and cannot affect the executor's build whichever builder it uses.
+#
+# It also means the logger's start command lives in the image rather than
+# depending on a per-application command override in the Dokploy UI.
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# No pip install, and no requirements.txt: trade_logger.py imports only the
+# standard library (json, os, sys, time, hmac, hashlib, urllib). That keeps
+# this image tiny, makes the build offline-safe, and sidesteps the root
+# requirements.txt entirely -- which is UTF-16LE encoded and therefore a
+# needless risk to drag into a build that does not need it.
+COPY trade_logger.py .
+
+# The append-only fill archive must outlive the container: a redeploy replaces
+# the image wholesale, so /data has to be a mounted volume or every release
+# starts the archive from scratch. Mount a named volume (or a Dokploy volume)
+# at /data.
+ENV TRADE_LOGGER_DATA_DIR=/data
+RUN mkdir -p /data
+
+# trade_logger.py logs via print(). Python block-buffers stdout when it is a
+# pipe rather than a tty, so without this the container log stays empty for
+# hours and a healthy logger is indistinguishable from a hung one.
+ENV PYTHONUNBUFFERED=1
+
+# Continuous mode: poll every 300s. Unset TRADE_LOGGER_INTERVAL (or override it
+# to empty) to make the same image a one-shot run instead, for driving from an
+# n8n Schedule -> Execute Command like signal_runner.py.
+ENV TRADE_LOGGER_INTERVAL=300
+
+# No EXPOSE: this service listens on nothing. It reads Bybit and appends to
+# /data/executions_real.jsonl.
+#
+# BYBIT_API_KEY and BYBIT_API_SECRET are NOT baked in -- there is no COPY of
+# .env here on purpose. Inject them as environment variables in Dokploy.
+CMD ["python", "trade_logger.py"]
