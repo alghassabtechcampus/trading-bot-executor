@@ -19,11 +19,17 @@ INDICATORS_DATA_DIR in the indicators service):
   executions_real.jsonl      - append-only, one JSON object per fill
   executions_real_state.json - resume cursor + seen execIds (dedupe)
 
+Each run re-reads TRADE_LOGGER_OVERLAP_SECONDS (default 180) before the last
+window's end, so a fill the API reveals late is still caught, and relies on
+execId dedupe to keep that re-read from duplicating rows. The two are a pair:
+see OVERLAP_MS and SEEN_IDS_MAX.
+
 One-shot by default (the project's pattern: n8n Schedule -> Execute Command,
 as with signal_runner.py). Set TRADE_LOGGER_INTERVAL to loop in-process.
 """
 
 import json,os,sys,time,hmac,hashlib,urllib.request,urllib.parse
+from collections import deque
 
 API_KEY = os.environ.get("BYBIT_API_KEY", "")
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
@@ -40,6 +46,33 @@ CATEGORY = "spot"
 RECV_WINDOW = "5000"
 SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 MAX_PAGES = 50
+
+# Each run re-reads this much time BEFORE the last window's end, instead of
+# resuming exactly where it stopped. Resuming exactly at last_end_ms loses any
+# fill whose execTime is earlier than that instant but which only becomes
+# queryable after it -- the window holding it is already consumed, so it is
+# never requested again and the gap is silent and permanent. Two real causes:
+# the endpoint's own visibility lag, and the container clock running ahead of
+# Bybit's (now_ms is this container's clock, not the exchange's).
+#
+# The overlap is only safe because dedupe on execId is correct -- see
+# SEEN_IDS_MAX below. Re-reading without reliable dedupe would append the same
+# fills again on every cycle, so these two mechanisms must stay in step.
+#
+# Floor of 60s: a smaller (or zero) value would silently reintroduce the gap.
+OVERLAP_MS = max(60, int(os.environ.get("TRADE_LOGGER_OVERLAP_SECONDS", "180"))) * 1000
+
+# How many recent execIds the state file remembers, for the dedupe that makes
+# the overlap above safe. Held in a deque in TIME order, newest last, so the
+# cap evicts the OLDEST ids -- the ones that can no longer reappear in any
+# future overlap window.
+#
+# It used to be sorted(seen)[-10000:], which ordered the ids as TEXT. Bybit
+# execIds are UUID-like hex, so text order is uncorrelated with time: past the
+# cap that kept a near-random subset rather than the most recent, dropping
+# exactly the recent ids an overlap re-read depends on, and appending duplicate
+# rows to an append-only archive.
+SEEN_IDS_MAX = 10000
 
 
 class FetchError(RuntimeError):
@@ -113,7 +146,9 @@ def load_state():
     return {"seen_exec_ids": [], "last_end_ms": 0}
 
 def save_state(state):
-    state["seen_exec_ids"] = state["seen_exec_ids"][-10000:]
+    # No truncation here any more: run_once holds seen_exec_ids in a deque with
+    # maxlen=SEEN_IDS_MAX, so it is already capped AND in time order. The old
+    # slice here re-sorted by text and dropped the wrong ids -- see SEEN_IDS_MAX.
     # Atomic: write a temp file, fsync, then rename over the original. The
     # plain open(...,"w") this replaced truncated the real file first, so a
     # container restart mid-write (routine here -- restart: unless-stopped plus
@@ -168,37 +203,37 @@ def row_to_record(r):
 
 def run_once(state):
     now_ms = int(time.time() * 1000)
-    start_ms = state.get("last_end_ms") or (now_ms - SEVEN_DAYS_MS)
+    last_end = int(state.get("last_end_ms") or 0)
+    if last_end:
+        # Step BACK by the overlap rather than resuming exactly at last_end, so a
+        # fill that only became queryable after the previous window closed is
+        # still covered. Safe only because the dedupe below is reliable.
+        cur_start = max(0, last_end - OVERLAP_MS)
+    else:
+        # First ever run: there is no previous window to overlap with.
+        cur_start = now_ms - SEVEN_DAYS_MS
     new_count = 0
-    cur_start = start_ms
-    # Set, not list: the dedupe test runs per row against up to 10k ids, which
-    # is a linear scan on a list. Serialised back to a list in save_state.
-    seen = set(state["seen_exec_ids"])
+    # Two structures, one purpose. seen_order is the capped, TIME-ordered history
+    # that gets persisted -- newest appended last, so maxlen evicts the oldest,
+    # which are the only ids that can no longer reappear in a future overlap.
+    # seen is an O(1) membership index over it. The state file stores the deque
+    # in this same order, so a restart reloads the ordering intact.
+    seen_order = deque(state["seen_exec_ids"], maxlen=SEEN_IDS_MAX)
+    seen = set(seen_order)
     while cur_start < now_ms:
         cur_end = min(cur_start + SEVEN_DAYS_MS, now_ms)
         cursor = None
         page_guard = 0
+        fresh = []
         while True:
             page_guard += 1
             rows, cursor = fetch_executions_window(cur_start, cur_end, cursor=cursor)
-            if rows:
-                new_rows = []
-                for r in rows:
-                    eid = r.get("execId")
-                    if not eid or eid in seen:
-                        continue
-                    new_rows.append(r)
-                    seen.add(eid)
-                if new_rows:
-                    # Append and fsync BEFORE last_end_ms advances below. If the
-                    # process dies in between, the next run re-reads the window
-                    # and dedupes on execId; the reverse order would lose fills.
-                    with open(LOG_PATH, "a", encoding="utf-8") as f:
-                        for r in new_rows:
-                            f.write(json.dumps(row_to_record(r), ensure_ascii=False) + "\n")
-                        f.flush()
-                        os.fsync(f.fileno())
-                    new_count += len(new_rows)
+            for r in rows:
+                eid = r.get("execId")
+                if not eid or eid in seen:
+                    continue
+                seen.add(eid)
+                fresh.append(r)
             if not cursor or not rows:
                 break
             if page_guard >= MAX_PAGES:
@@ -212,7 +247,26 @@ def run_once(state):
                     f"not advancing cursor. Narrow the window or raise MAX_PAGES."
                 )
             time.sleep(0.2)
-        state["seen_exec_ids"] = sorted(seen)
+
+        if fresh:
+            # Order by execTime before ANYTHING is recorded. Bybit paginates
+            # newest-first, so registering ids page by page would feed the deque
+            # newest-first and its cap would then evict the NEWEST ids -- exactly
+            # the ones the overlap re-read depends on. Collecting the whole
+            # window first is what makes the time ordering true across pages.
+            fresh.sort(key=lambda row: int(row.get("execTime") or 0))
+            # Append and fsync BEFORE last_end_ms advances below. If the process
+            # dies in between, the next run re-reads the window and dedupes on
+            # execId; the reverse order would lose fills.
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                for r in fresh:
+                    f.write(json.dumps(row_to_record(r), ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            seen_order.extend(r.get("execId") for r in fresh)
+            new_count += len(fresh)
+
+        state["seen_exec_ids"] = list(seen_order)
         state["last_end_ms"] = cur_end
         cur_start = cur_end
         save_state(state)
