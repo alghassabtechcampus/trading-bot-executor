@@ -36,6 +36,19 @@ backtest/results/
 backtest/*.log
 backtest/v2/runs/
 
+# Study outputs written to the REPO ROOT, not under backtest/. The pattern above
+# only covers backtest/results/, which is why a 111MB equity_curve.csv reached a
+# commit and GitHub refused the push (its hard limit is 100MB). All of this is
+# regenerable from the scripts in backtest/analysis/ and liquidation_*_test.py,
+# so it does not belong in git at any size.
+backtest_results/
+data_liq/
+data_funding/
+data_oi/
+data_15m/
+liq_events*.csv
+liq_stress_episodes.csv
+
 # Generated indicator dashboard outputs
 indicators/cache/
 indicators/history/
