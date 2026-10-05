@@ -1,0 +1,61 @@
+# Executor web service + the real-trade logger.
+#
+# Both containers come from the SAME image (the root Dockerfile): they share
+# the Bybit credential and the requests/dotenv dependencies, and building once
+# keeps them from drifting apart. They differ only in `command`, so either can
+# crash, restart or be redeployed without touching the other.
+#
+# NOT included here: the indicators dashboard / alert-watcher. That service has
+# its own image, built by .github/workflows/indicators-image.yml and pulled
+# from ghcr.io by Dokploy, and it deliberately holds no trading credential
+# (indicators/Dockerfile explains why). Keep it deployed separately -- merging
+# it into this stack would put BYBIT_API_SECRET in its environment.
+
+services:
+  executor:
+    build: .
+    image: trading-bot-executor:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # liq_flush kill switch. Default false IN CODE too (liq_flush.is_enabled),
+      # so a fresh image never trades until this is set deliberately. Setting it
+      # false again does NOT abandon open positions: /liq_tick still runs exits,
+      # it only stops new entries -- a switch that stranded a position past its
+      # -8% stop would be worse than no switch.
+      LIQ_ENABLED: "${LIQ_ENABLED:-false}"
+      # Everything except orders. Writes to liq:dry:* so the full state machine
+      # (cooldown, caps, 24h exit) is exercised without touching the real keys.
+      LIQ_DRY_RUN: "${LIQ_DRY_RUN:-false}"
+      LIQ_USDT_PER_TRADE: "${LIQ_USDT_PER_TRADE:-10}"
+    ports:
+      - "5000:5000"
+    # CMD from the Dockerfile (gunicorn app:app) is used as-is. Note its
+    # --timeout is 180, not 30: the hourly /liq_tick scan takes ~60s. See the
+    # Dockerfile for why, and raise the n8n HTTP Request timeout to match.
+
+  trade-logger:
+    # Its own Dockerfile, so this stack does not depend on how the executor is
+    # built. See Dockerfile.trade_logger for why that matters.
+    build:
+      context: .
+      dockerfile: Dockerfile.trade_logger
+    image: trade-logger:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Loop in-process every 5 minutes. Unset this and the script becomes a
+      # one-shot run instead, for driving from an n8n Schedule -> Execute
+      # Command like signal_runner.py.
+      TRADE_LOGGER_INTERVAL: "300"
+      TRADE_LOGGER_DATA_DIR: /data
+    volumes:
+      # Named volume, NOT a bind mount: survives `docker compose down` and
+      # every image rebuild. This is the permanent fill archive.
+      - trades_data:/data
+    command: ["python", "trade_logger.py"]
+    # No ports: this container serves nothing. It only reads Bybit and appends
+    # to /data/trades_real.jsonl.
+
+volumes:
+  trades_data:

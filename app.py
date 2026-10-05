@@ -9,12 +9,17 @@ import hmac
 import json
 import logging
 import os
+import sys
 import time
 
 import requests
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 load_dotenv('.env')
+
+# استراتيجية liq_flush معزولة في وحدة خاصة: مفاتيح Redis خاصة بها، ومسار بيع
+# خاص بها، فلا تلمس trade:* ولا pending:* ولا close_tracked_trade.
+import liq_flush
 
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -1248,6 +1253,36 @@ def positions():
             })
 
     return jsonify({"result": result}), 200
+
+
+@app.route("/liq_tick", methods=["POST"])
+@protected_route
+def liq_tick():
+    """النبضة الساعية لاستراتيجية liq_flush — ينادى من n8n كل ساعة + دقيقتين.
+
+    لماذا مسار يناديه n8n وليس مؤقّتاً داخل الحاوية: هذا هو نمط المشروع المعلن
+    (راجع indicators/scheduler.py:3) — n8n يحمل الجدولة وحده ولا يحمل أي منطق،
+    والرسائل تعود هنا في messages[] فتبعثها عقدة Telegram الموجودة أصلاً، بدون
+    إدخال بيانات بوت تلغرام إلى الحاوية التي تحمل مفتاح Bybit.
+
+    مهم: الفحص يستغرق ~60 ثانية (17 رمزاً × 5 طلبات Bybit)، لذلك رُفع
+    gunicorn --timeout إلى 180 في Dockerfile ولازم مهلة عقدة HTTP Request في
+    n8n تكون أطول من ذلك أيضاً، وإلا قُتل العامل في منتصف النبضة.
+
+    run_tick لا يرمي استثناءً: الأخطاء تعود في errors[] بـ 200 حتى لا يسقط
+    المسار بقية الخدمة.
+    """
+    payload = request.get_json(silent=True) or {}
+    # sys.modules[__name__] = وحدة app نفسها. liq_flush يستقبل مساعداته بالحقن
+    # ليكون قابلاً للاختبار على كائن مزيّف بلا شبكة — الشرح في liq_flush.py.
+    return jsonify(liq_flush.run_tick(sys.modules[__name__], payload)), 200
+
+
+@app.route("/liq_positions", methods=["GET"])
+@protected_route
+def liq_positions():
+    """مراكز liq_flush المفتوحة. منفصل عن /positions الذي يقرأ trade:* فقط."""
+    return jsonify(liq_flush.list_positions(sys.modules[__name__])), 200
 
 
 @app.errorhandler(Exception)
