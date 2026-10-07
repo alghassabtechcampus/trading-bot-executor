@@ -63,6 +63,16 @@ STOP_KLINE_LIMIT = 30
 # Google Sheet عبر n8n + executions_real.jsonl من trade_logger.py).
 CLOSED_TTL_SECONDS = 90 * 24 * 60 * 60
 
+# حدّ "عدم تطابق الرصيد": لو الموجود في المحفظة أقل من 90% من الكمية المسجّلة،
+# فهذه ليست رسوماً ولا تقريب خطوة — هذه قراءة رصيد خاطئة أو بيع من مكان آخر.
+# الفرق بينها وبين الغبار: الغبار = الكمية المسجّلة نفسها أصغر من حد البيع،
+# وعدم التطابق = كنّا نتوقّع كمية قابلة للبيع فوجدنا أقل منها بكثير.
+MISMATCH_FRACTION = Decimal("0.90")
+
+# لا نعيد المحاولة إلى ما لا نهاية: بعد هذا العدد من الفحوص المتتالية بنفس
+# الحالة، يُغلق السجل بحالة needs_manual_check حتى لا يبقى يحذّر كل ساعة للأبد.
+MAX_EXIT_ATTEMPTS = 3
+
 
 # ============================================================
 # الإعدادات من البيئة — تُقرأ عند كل نداء
@@ -169,10 +179,12 @@ def buy_message(symbol: str, price: Decimal, z_r4: float, z_oi4: float) -> str:
             f"z سعر {z_r4:.1f} / z OI {z_oi4:.1f} — خروج بعد 24 ساعة أو وقف 8%")
 
 
-def sell_message(symbol: str, reason: str, pnl_pct: Decimal, pnl_usd: Decimal) -> str:
+def sell_message(symbol: str, reason: str, pnl_pct: Decimal, pnl_usd: Decimal,
+                 *, dry: bool = False) -> str:
     reason_ar = {"time": "24 ساعة", "stop": "وقف"}.get(reason, reason)
     mark = "🟢" if pnl_usd >= 0 else "🔴"
-    return (f"{mark} بيع: {symbol} — سبب: {reason_ar} — "
+    tag = "🧪 تجريبي — " if dry else ""
+    return (f"{tag}{mark} بيع: {symbol} — سبب: {reason_ar} — "
             f"ربح/خسارة {pnl_pct:+.2f}% و {pnl_usd:+.2f}$")
 
 
@@ -228,6 +240,129 @@ def lowest_low_since(ex: Any, symbol: str, since_ms: int, now_ms: int) -> Decima
 # الخروج
 # ============================================================
 
+def _reason_with_quantities(reason: str, remaining: Decimal, expected: Decimal) -> str:
+    """سبب الخروج ومعه الكميتان في خانة واحدة.
+
+    تبويب liq_flush في الشيت له 18 عموداً ثابتة (A1:R1)، فإضافة عمودين جديدين
+    تكسر ربط عقدة Google Sheets في n8n. الكميتان تُحقنان هنا داخل نص السبب —
+    خانة نصية أصلاً — فيصل الرقمان إلى الشيت بدون أي تغيير في المخطّط.
+    """
+    return f"{reason} remaining={_num(remaining)} expected={_num(expected)}"
+
+
+def _close_unsold(
+    ex: Any,
+    record: dict[str, Any],
+    reason: str,
+    *,
+    now: int,
+    dry: bool,
+    remaining_qty: Decimal,
+    expected_qty: Decimal,
+    price_now: Decimal,
+) -> dict[str, Any]:
+    """يغلق صفقة لم تُبَع فعلاً، مع صف خروج كامل بدل الحذف الصامت.
+
+    الربح هنا تقييم سوقي لما تبقّى فعلاً مقابل ما دُفع كاملاً: دُفع entry_value
+    وبقي remaining_qty قيمتها كذا. لو كان المتبقي غباراً فالنتيجة خسارة شبه
+    كاملة — وهي النتيجة الحقيقية طالما أن ما تبقّى غير قابل للبيع. إخفاؤها هو
+    ما كان العيب.
+    """
+    symbol = str(record["symbol"])
+    entry_value = ex.as_decimal(record["entry_value"], "entry_value")
+    remaining_value = remaining_qty * price_now
+    pnl_usd = _round(remaining_value - entry_value, "0.00000001")
+    pnl_pct = _round(
+        (pnl_usd / entry_value * Decimal("100")) if entry_value > 0 else Decimal("0"),
+        "0.0001",
+    )
+
+    closed = {
+        **record,
+        "exit_time": now,
+        "exit_time_iso": _iso(now),
+        "exit_price": _num(price_now),
+        "exit_qty": _num(remaining_qty),
+        "exit_value": _num(remaining_value),
+        "exit_fee": "0",
+        "exit_order_id": "",
+        "exit_reason": _reason_with_quantities(reason, remaining_qty, expected_qty),
+        "exit_reason_code": reason,
+        "unsold": True,
+        "remaining_qty": _num(remaining_qty),
+        "expected_qty": _num(expected_qty),
+        "pnl": _num(pnl_usd),
+        "pnl_pct": _num(pnl_pct),
+        "hold_hours": round((now - int(record["entry_time"])) / 3600, 2),
+    }
+    ex.redis_set_json(closed_key(symbol, now, dry), closed, ex_seconds=CLOSED_TTL_SECONDS)
+    ex.redis_delete(open_key(symbol, dry))
+    return closed
+
+
+def _retry_or_escalate(
+    ex: Any,
+    record: dict[str, Any],
+    reason: str,
+    *,
+    now: int,
+    dry: bool,
+    remaining_qty: Decimal,
+    expected_qty: Decimal,
+    price_now: Decimal,
+) -> dict[str, Any]:
+    """رصيد أقل بكثير من المتوقّع: لا نبيع ولا نحذف — نعيد المحاولة ثم نصعّد.
+
+    قراءة رصيد خاطئة أو خطأ حساب قد تُصلح نفسها في الفحص التالي، فالحذف الفوري
+    يفقد مركزاً حقيقياً. وفي المقابل التكرار بلا سقف يعني تحذيراً كل ساعة إلى
+    الأبد، فبعد MAX_EXIT_ATTEMPTS فحصاً متتالياً بنفس الحالة يُغلق السجل
+    بـ needs_manual_check ليتدخّل إنسان.
+    """
+    symbol = str(record["symbol"])
+    previous = str(record.get("exit_block_code") or "")
+    attempts = int(record.get("exit_attempts") or 0)
+    attempts = attempts + 1 if previous == "balance_mismatch" else 1
+
+    if attempts >= MAX_EXIT_ATTEMPTS:
+        closed = _close_unsold(
+            ex, record, "needs_manual_check", now=now, dry=dry,
+            remaining_qty=remaining_qty, expected_qty=expected_qty, price_now=price_now,
+        )
+        logger.error("liq balance mismatch on %s unresolved after %d checks — "
+                     "closed as needs_manual_check (remaining=%s expected=%s)",
+                     symbol, attempts, _num(remaining_qty), _num(expected_qty))
+        return {
+            "symbol": symbol,
+            "status": "needs_manual_check",
+            "reason": reason,
+            "attempts": attempts,
+            "remaining_qty": _num(remaining_qty),
+            "expected_qty": _num(expected_qty),
+            "closed": closed,
+        }
+
+    # السجل يبقى مفتوحاً: الفحص التالي يعيد المحاولة من البداية.
+    record["exit_block_code"] = "balance_mismatch"
+    record["exit_attempts"] = attempts
+    record["exit_last_check"] = now
+    record["exit_last_check_iso"] = _iso(now)
+    record["remaining_qty"] = _num(remaining_qty)
+    record["expected_qty"] = _num(expected_qty)
+    ex.redis_set_json(open_key(symbol, dry), record)
+
+    logger.error("liq balance mismatch on %s: remaining=%s expected=%s (check %d/%d)",
+                 symbol, _num(remaining_qty), _num(expected_qty),
+                 attempts, MAX_EXIT_ATTEMPTS)
+    return {
+        "symbol": symbol,
+        "status": "balance_mismatch",
+        "reason": reason,
+        "attempts": attempts,
+        "remaining_qty": _num(remaining_qty),
+        "expected_qty": _num(expected_qty),
+    }
+
+
 def _close_position(
     ex: Any,
     record: dict[str, Any],
@@ -245,38 +380,70 @@ def _close_position(
     filters = ex.get_instrument_filters(symbol)
     step = filters["qty_step"]
 
-    # ×0.999 مثل close_tracked_trade في app.py: رسوم الشراء تُخصم من العملة
-    # الأساسية، فبيع الكمية المسجّلة حرفياً يُرفض بـ "insufficient balance".
-    target_qty = ex.floor_to_step(held_qty * Decimal("0.999"), step)
-
-    # سقف احترازي بالرصيد الفعلي. الحد الأدنى يحمي من بيع عملات استراتيجية أخرى
-    # لو كانت الكمية المسجّلة أكبر من الموجود (بيع يدوي بينهما مثلاً).
-    coin = ex.coin_from_symbol(symbol)
-    wallet_qty = ex.get_coin_balance(coin)["wallet_balance"]
-    sell_qty = min(target_qty, ex.floor_to_step(wallet_qty, step))
-
     price_now = ex.get_ticker_price(symbol)
 
-    # غبار: أقل من الحد الأدنى للكمية أو للقيمة. نسجّل وننظّف ونكمل، كما طُلب.
-    if sell_qty <= 0 or sell_qty < filters["min_qty"] or sell_qty * price_now < filters["min_amt"]:
-        ex.redis_delete(open_key(symbol, dry))
-        logger.warning("liq dust left on %s: qty=%s value=%s — record cleared",
-                       symbol, _num(sell_qty), _num(sell_qty * price_now))
-        return {
-            "symbol": symbol,
-            "status": "dust_cleared",
-            "reason": reason,
-            "qty": _num(sell_qty),
-            "value": _num(sell_qty * price_now),
-        }
-
     if dry:
+        # لا شراء فعلي حصل، فلا يوجد رصيد حقيقي يُفحص: قراءة المحفظة هنا كانت
+        # تقيس عملات استراتيجية أخرى (أو صفراً) فتحوّل كل خروج تجريبي إلى
+        # "غبار" يُحذف بصمت — وهذا بالضبط ما كان يخفي نتيجة الصفقة.
+        # الصفقة وهمية بالكمية المسجّلة بالضبط: بلا حسم 0.999 لأن رسوم الشراء
+        # التي يعوّضها ذلك الحسم لم تُدفع أصلاً، فيأتي الربح مطابقاً للباك-تيست.
+        exit_qty = ex.floor_to_step(held_qty, step)
         exit_price = price_now
-        exit_qty = sell_qty
         exit_value = exit_price * exit_qty
         exit_fee = Decimal("0")
         exit_order_id = f"DRY-SELL-{symbol}-{now}"
     else:
+        # ×0.999 مثل close_tracked_trade في app.py: رسوم الشراء تُخصم من العملة
+        # الأساسية، فبيع الكمية المسجّلة حرفياً يُرفض بـ "insufficient balance".
+        target_qty = ex.floor_to_step(held_qty * Decimal("0.999"), step)
+
+        # سقف احترازي بالرصيد الفعلي. الحد الأدنى يحمي من بيع عملات استراتيجية
+        # أخرى لو كانت الكمية المسجّلة أكبر من الموجود (بيع يدوي بينهما مثلاً).
+        coin = ex.coin_from_symbol(symbol)
+        wallet_qty = ex.get_coin_balance(coin)["wallet_balance"]
+        available = ex.floor_to_step(wallet_qty, step)
+        sell_qty = min(target_qty, available)
+
+        # المقارنة والتبليغ بالكميات الخام: المسجّل مقابل الموجود في المحفظة.
+        # التقريب لخطوة الأمر تفصيلة تنفيذية تُظهر صفراً حين يكون المتبقي أصغر
+        # من الخطوة، وهو أسوأ رقم يمكن وضعه في تحذير.
+        #
+        # فحص عدم التطابق يسبق فحص "قابل للبيع" عمداً: نقص 50% قد يكون قابلاً
+        # للبيع تماماً، وبيعه بصمت بنصف الحجم يخفي الخطأ بدل أن يكشفه. الشرط
+        # الثاني (أن المركز المتوقّع كان قابلاً للبيع) هو ما يفصل هذه الحالة عن
+        # "مجرد غبار": مركز صغير أصلاً لا يوجد فيه ما يُستغرب.
+        expected_sellable = (target_qty >= filters["min_qty"]
+                             and target_qty * price_now >= filters["min_amt"])
+        if expected_sellable and wallet_qty < held_qty * MISMATCH_FRACTION:
+            return _retry_or_escalate(
+                ex, record, reason, now=now, dry=dry,
+                remaining_qty=wallet_qty, expected_qty=held_qty,
+                price_now=price_now,
+            )
+
+        sellable = (sell_qty > 0
+                    and sell_qty >= filters["min_qty"]
+                    and sell_qty * price_now >= filters["min_amt"])
+
+        if not sellable:
+            closed = _close_unsold(
+                ex, record, "dust_unsellable", now=now, dry=dry,
+                remaining_qty=wallet_qty, expected_qty=held_qty, price_now=price_now,
+            )
+            logger.warning("liq dust on %s: remaining=%s expected=%s value=%s",
+                           symbol, _num(wallet_qty), _num(held_qty),
+                           _num(wallet_qty * price_now))
+            return {
+                "symbol": symbol,
+                "status": "dust_unsellable",
+                "reason": reason,
+                "remaining_qty": _num(wallet_qty),
+                "expected_qty": _num(held_qty),
+                "value": _num(wallet_qty * price_now),
+                "closed": closed,
+            }
+
         response = ex.create_market_sell(symbol, sell_qty, order_link_id("s", symbol, now))
         order_id = response.get("result", {}).get("orderId")
         if not order_id:
@@ -398,18 +565,47 @@ def process_exits(ex: Any, result: dict[str, Any], *, now: int, dry: bool) -> No
             sale = _close_position(ex, record, reason, now=now, dry=dry)
             result["exits"].append(sale)
 
-            if sale["status"] == "sold":
+            status = sale["status"]
+            if status == "sold":
                 closed = sale["closed"]
                 result["journal"].append(_journal_exit(closed))
                 result["messages"].append(sell_message(
                     symbol, reason,
                     Decimal(closed["pnl_pct"]),
                     Decimal(closed["pnl"]),
+                    dry=dry,
                 ))
-            else:
+
+            elif status == "dust_unsellable":
+                # صف خروج كامل أولاً: نتيجة الصفقة تُسجَّل حتى حين يتعذّر البيع.
+                closed = sale["closed"]
+                result["journal"].append(_journal_exit(closed))
                 result["messages"].append(warn_message(
-                    f"غبار متبقٍ في {symbol} أقل من الحد الأدنى للبيع — "
-                    f"أُزيل السجل بدون أمر بيع (سبب الخروج: {reason})"
+                    f"{symbol}: الصفقة ما انباعت — المتبقي "
+                    f"{sale['remaining_qty']} أقل من الحد الأدنى للبيع "
+                    f"(المتوقّع {sale['expected_qty']}، قيمة المتبقي "
+                    f"{sale['value']}$). سُجّل صف خروج بسبب dust_unsellable "
+                    f"(سبب الخروج: {reason})"
+                ))
+
+            elif status == "balance_mismatch":
+                # لا صف خروج: الصفقة ما زالت مفتوحة وستُعاد محاولتها.
+                result["messages"].append(warn_message(
+                    f"عدم تطابق الرصيد في {symbol}: الموجود "
+                    f"{sale['remaining_qty']} والمتوقّع {sale['expected_qty']} "
+                    f"(أقل من {MISMATCH_FRACTION * 100:.0f}% من المسجّل). "
+                    f"لم يُبَع ولم يُحذف — محاولة {sale['attempts']}/"
+                    f"{MAX_EXIT_ATTEMPTS}، يُعاد الفحص في النبضة التالية"
+                ))
+
+            elif status == "needs_manual_check":
+                closed = sale["closed"]
+                result["journal"].append(_journal_exit(closed))
+                result["messages"].append(warn_message(
+                    f"🛑 {symbol}: عدم تطابق الرصيد استمر {sale['attempts']} "
+                    f"فحوص متتالية (الموجود {sale['remaining_qty']} والمتوقّع "
+                    f"{sale['expected_qty']}). أُغلق السجل بحالة "
+                    f"needs_manual_check — يحتاج مراجعة يدوية على المنصة"
                 ))
 
         except Exception as exc:  # noqa: BLE001 — رمز واحد فاشل لا يوقف الباقي

@@ -60,6 +60,7 @@ class FakeExecutor:
         self.tracked: dict[str, dict] = {}
         self.pending: dict[str, dict] = {}
         self.raise_on_price: set[str] = set()
+        self.coin_balance_calls: list[str] = []
         self.min_qty = Decimal("0.0001")
         self.min_amt = Decimal("5")
         self.qty_step = Decimal("0.0001")
@@ -126,6 +127,7 @@ class FakeExecutor:
         return self.usdt
 
     def get_coin_balance(self, coin):
+        self.coin_balance_calls.append(coin)
         return {
             "wallet_balance": self.wallet,
             "available": self.wallet,
@@ -468,7 +470,10 @@ def test_exit_sells_the_full_recorded_qty(ex):
     assert qty == Decimal("0.0999")
 
 
-def test_dust_below_min_order_is_logged_and_cleared_not_sold(ex):
+def test_dust_below_min_order_writes_an_exit_row_instead_of_vanishing(ex):
+    """The old behaviour deleted the record with no sheet row, no message and no
+    sell -- the trade's result simply disappeared. Now it still does not sell,
+    but it has to say so."""
     _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0, qty="0.00001")
     ex.wallet = Decimal("0.00001")
     ex.klines["SOLUSDT"] = []
@@ -476,10 +481,175 @@ def test_dust_below_min_order_is_logged_and_cleared_not_sold(ex):
     result = _blank()
     liq_flush.process_exits(ex, result, now=T0 + 24 * HOUR, dry=False)
 
-    assert result["exits"][0]["status"] == "dust_cleared"
+    assert result["exits"][0]["status"] == "dust_unsellable"
     assert ex.sells == []
     assert liq_flush.open_key("SOLUSDT", False) not in ex.store
-    assert any("غبار" in m for m in result["messages"])
+
+    # the row the sheet gets
+    row = result["journal"][0]
+    assert row["event"] == "exit"
+    assert row["symbol"] == "SOLUSDT"
+    assert row["exit_reason"].startswith("dust_unsellable")
+    assert "remaining=0.00001" in row["exit_reason"]
+    assert "expected=0.00001" in row["exit_reason"]
+    assert row["exit_time"] and row["exit_price"] and row["pnl"] is not None
+
+    # and a warning that names the leftover
+    assert any("ما انباعت" in m and "0.00001" in m for m in result["messages"])
+
+
+def test_dust_exit_row_keeps_the_eighteen_sheet_keys(ex):
+    """The liq_flush tab is 18 fixed columns (A1:R1). An unsold row must not
+    widen the schema, or n8n's Sheets mapping breaks on deploy."""
+    _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0, qty="0.00001")
+    ex.wallet = Decimal("0.00001")
+    ex.klines["SOLUSDT"] = []
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + 24 * HOUR, dry=False)
+
+    _seed_open(ex, "ADAUSDT", entry_price="100", entry_time=T0, qty="0.1")
+    ex.wallet = Decimal("1000000")
+    ex.klines["ADAUSDT"] = []
+    normal = _blank()
+    liq_flush.process_exits(ex, normal, now=T0 + 24 * HOUR, dry=False)
+
+    assert set(result["journal"][0]) == set(normal["journal"][0])
+    assert len(result["journal"][0]) == 18
+
+
+def test_balance_far_below_expected_is_not_deleted_and_warns(ex):
+    """Half the coins missing is not dust -- it is a bad balance read or a bad
+    calculation, and deleting the record would lose a real position."""
+    _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0, qty="0.1")
+    ex.wallet = Decimal("0.05")          # 50% of the recorded 0.1
+    ex.klines["SOLUSDT"] = []
+
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + 24 * HOUR, dry=False)
+
+    assert result["exits"][0]["status"] == "balance_mismatch"
+    assert result["exits"][0]["attempts"] == 1
+    assert ex.sells == []
+    # the position stays open for the next tick
+    assert liq_flush.open_key("SOLUSDT", False) in ex.store
+    assert result["journal"] == []       # nothing claimed about the result yet
+    assert any("عدم تطابق الرصيد" in m for m in result["messages"])
+
+
+def test_a_balance_just_under_the_recorded_qty_still_sells(ex):
+    """Fees shave a little off the base coin, so 'slightly less' is normal and
+    must not be mistaken for a mismatch."""
+    _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0, qty="0.1")
+    ex.wallet = Decimal("0.0995")        # 99.5% -- above the 90% floor
+    ex.klines["SOLUSDT"] = []
+
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + 24 * HOUR, dry=False)
+
+    assert result["exits"][0]["status"] == "sold"
+    assert ex.sells
+
+
+def test_mismatch_escalates_to_needs_manual_check_after_three_checks(ex):
+    _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0, qty="0.1")
+    ex.wallet = Decimal("0.05")
+    ex.klines["SOLUSDT"] = []
+
+    seen = []
+    for attempt in range(3):
+        result = _blank()
+        liq_flush.process_exits(ex, result, now=T0 + (24 + attempt) * HOUR, dry=False)
+        seen.append(result)
+
+    assert [r["exits"][0]["status"] for r in seen] == [
+        "balance_mismatch", "balance_mismatch", "needs_manual_check"]
+    assert [r["exits"][0]["attempts"] for r in seen] == [1, 2, 3]
+
+    # only the final check closes the record, and it closes it loudly
+    assert liq_flush.open_key("SOLUSDT", False) not in ex.store
+    assert ex.sells == []
+    final = seen[-1]
+    assert final["journal"][0]["exit_reason"].startswith("needs_manual_check")
+    assert any("needs_manual_check" in m for m in final["messages"])
+    assert seen[0]["journal"] == [] and seen[1]["journal"] == []
+
+
+def test_attempt_counter_resets_when_the_balance_comes_back(ex):
+    """A transient bad read must not leave a trade one strike from being closed
+    for good once the balance is healthy again."""
+    _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0, qty="0.1")
+    ex.wallet = Decimal("0.05")
+    ex.klines["SOLUSDT"] = []
+    liq_flush.process_exits(ex, _blank(), now=T0 + 24 * HOUR, dry=False)
+    assert ex.store[liq_flush.open_key("SOLUSDT", False)]["exit_attempts"] == 1
+
+    ex.wallet = Decimal("0.1")           # balance recovered
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + 25 * HOUR, dry=False)
+    assert result["exits"][0]["status"] == "sold"
+    assert ex.sells
+
+
+def test_dry_run_exit_never_reads_the_real_wallet(ex):
+    """There was no real buy, so there is no real balance to check. Reading one
+    measured another strategy's coins (or zero) and turned every paper exit into
+    silent 'dust' -- which is how the paper trade's result went missing."""
+    _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0, qty="0.1", dry=True)
+    ex.wallet = Decimal("0")             # nothing of this coin is really held
+    ex.prices["SOLUSDT"] = Decimal("110")
+    ex.klines["SOLUSDT"] = []
+
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + 24 * HOUR, dry=True)
+
+    assert ex.coin_balance_calls == []
+    assert ex.sells == []
+    assert result["exits"][0]["status"] == "sold"
+
+
+def test_dry_run_time_exit_writes_a_full_row_and_a_sell_message(ex):
+    _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0, qty="0.1", dry=True)
+    ex.wallet = Decimal("0")
+    ex.prices["SOLUSDT"] = Decimal("110")
+    ex.klines["SOLUSDT"] = []
+
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + 24 * HOUR, dry=True)
+
+    row = result["journal"][0]
+    assert row["event"] == "exit" and row["exit_reason"] == "time"
+    assert row["exit_time"] and row["exit_price"] == "110"
+    assert row["dry_run"] is True
+    # bought 0.1 at 100 = 10, sold 0.1 at 110 = 11, and no fee is charged on paper
+    assert Decimal(row["pnl"]) == Decimal("1")
+    assert Decimal(row["pnl_pct"]) == Decimal("10")
+
+    message = result["messages"][0]
+    assert "تجريبي" in message and "بيع" in message
+    assert liq_flush.open_key("SOLUSDT", True) not in ex.store
+
+
+def test_dry_run_stop_exit_also_reports_normally(ex):
+    _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0, qty="0.1", dry=True)
+    ex.wallet = Decimal("0")
+    ex.prices["SOLUSDT"] = Decimal("90")
+    ex.klines["SOLUSDT"] = []
+
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + HOUR, dry=True)
+
+    assert result["exits"][0]["reason"] == "stop"
+    assert result["journal"][0]["exit_reason"] == "stop"
+    assert "تجريبي" in result["messages"][0]
+    assert ex.coin_balance_calls == [] and ex.sells == []
+
+
+def test_live_exit_message_is_not_tagged_as_paper(ex):
+    _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0, qty="0.1")
+    ex.klines["SOLUSDT"] = []
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + 24 * HOUR, dry=False)
+    assert "تجريبي" not in result["messages"][0]
 
 
 def test_exit_record_carries_everything_the_sheet_needs(ex):
