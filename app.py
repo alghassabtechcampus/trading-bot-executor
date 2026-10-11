@@ -1285,6 +1285,23 @@ def liq_positions():
     return jsonify(liq_flush.list_positions(sys.modules[__name__])), 200
 
 
+@app.route("/liq_health", methods=["GET"])
+@protected_route
+def liq_health():
+    """متى وصلت آخر نبضة liq_flush إلى هذه الحاوية، وكم عمرها بالدقائق.
+
+    منفصل عن /health الذي يقول "الخدمة ترد" فقط: نبضة n8n قد تفشل قبل أن
+    تصل أصلاً (خطأ DNS على المضيف، وقد حدث 3 مرات في 2026-10-08) فتبقى
+    الخدمة سليمة تماماً والاستراتيجية ميتة بلا أي أثر. هذا المسار يكشف ذلك.
+
+    محمي بالسر مثل بقية مسارات liq: يكشف حالة الاستراتيجية، و/health
+    العام يكفي لفحص الحياة من غير مصادقة.
+
+    قراءة فقط: مفتاح Redis واحد، بلا أي نداء لـ Bybit.
+    """
+    return jsonify(liq_flush.health(sys.modules[__name__])), 200
+
+
 @app.errorhandler(Exception)
 def unhandled_error(error):
     logger.exception("Unhandled server error")

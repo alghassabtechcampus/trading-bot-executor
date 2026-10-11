@@ -73,6 +73,22 @@ MISMATCH_FRACTION = Decimal("0.90")
 # الحالة، يُغلق السجل بحالة needs_manual_check حتى لا يبقى يحذّر كل ساعة للأبد.
 MAX_EXIT_ATTEMPTS = 3
 
+# مهلة حجز الدخول. تغطّي أمر الشراء وانتظار الفيل كاملاً وتزيد، فلو مات العامل
+# في منتصف الشراء رجع الرمز قابلاً للدخول بعدها — ومع ذلك تبقى التهدئة وسجل
+# الدخول يمنعانه 24 ساعة، فالفشل يميل إلى عدم الدخول لا إلى الدخول مرتين.
+ENTRY_RESERVE_SECONDS = 10 * 60
+
+# عمر سجل الدخول. أطول من التهدئة (24 ساعة) لأن وظيفته أن يبقى حين تختفي
+# التهدئة: لو حُذف مفتاح التهدئة أو انتهى قبل وقته، هذا السجل وحده يمنع
+# الدخول المكرّر. الفرق بينه وبين liq:closed: أن هذا يُكتب عند الدخول لا الخروج،
+# فيغطّي الصفقة المفتوحة أيضاً.
+ENTRY_JOURNAL_SECONDS = 48 * 60 * 60
+
+# النبضة كل ساعة (جدول n8n: الدقيقة 2 من كل ساعة). "متقادمة" = فاتت نبضة
+# كاملة ونصف — هامش يمنع إنذاراً كاذباً من تأخّر دقائق في الجدول.
+TICK_INTERVAL_MINUTES = 60
+STALE_AFTER_MINUTES = 90
+
 
 # ============================================================
 # الإعدادات من البيئة — تُقرأ عند كل نداء
@@ -125,6 +141,26 @@ def closed_key(symbol: str, stamp: int, dry: bool) -> str:
 
 def lock_key(dry: bool) -> str:
     return f"{_prefix(dry)}:tick:lock"
+
+
+def reserve_key(symbol: str, dry: bool) -> str:
+    """حجز الدخول لرمز واحد. يُؤخذ بـ SET NX قبل أمر الشراء — راجع
+    process_entries: كل الفحوص قبله "اقرأ ثم اكتب"، وهذا وحده ذرّي."""
+    return f"{_prefix(dry)}:reserve:{symbol}"
+
+
+def journal_key(symbol: str, stamp: int, dry: bool) -> str:
+    """سجل الدخول: مفتاح واحد لكل دخول، والوقت في اسم المفتاح نفسه حتى يُقرأ
+    بـ KEYS بدون GET لكل رمز."""
+    return f"{_prefix(dry)}:journal:{symbol}:{stamp}"
+
+
+def journal_pattern(symbol: str, dry: bool) -> str:
+    return f"{_prefix(dry)}:journal:{symbol}:*"
+
+
+def last_tick_key(dry: bool) -> str:
+    return f"{_prefix(dry)}:last_tick"
 
 
 def order_link_id(side: str, symbol: str, stamp: int) -> str:
@@ -707,7 +743,36 @@ def _open_position(
         {"entered": now, "entry_price": record["entry_price"]},
         ex_seconds=COOLDOWN_SECONDS,
     )
+    # سجل الدخول: عائلة مفاتيح ثالثة مستقلة عن open: وcooldown:. الحارسان
+    # الأولان مفتاح واحد لكل رمز، فحذفه — يدوياً أو بانتهاء مهلة قبل وقتها —
+    # يفتح الرمز للدخول فوراً. هذا السجل يُقرأ أيضاً في process_entries، فمسح
+    # الحارسين وحدهما لم يعد كافياً لإعادة الدخول قبل 24 ساعة.
+    # ملاحظة صريحة: مسح البادئة كلها يمسح هذا أيضاً — الحماية طبقة إضافية
+    # لا ضمان مطلق.
+    ex.redis_set_json(
+        journal_key(symbol, now, dry),
+        {"entered": now, "entered_iso": _iso(now),
+         "entry_price": record["entry_price"], "qty": record["qty"]},
+        ex_seconds=ENTRY_JOURNAL_SECONDS,
+    )
     return record
+
+
+def _last_journal_entry(ex: Any, symbol: str, *, dry: bool) -> int:
+    """وقت أحدث دخول مسجّل لهذا الرمز، أو 0 إذا لا سجل.
+
+    الوقت يُقرأ من اسم المفتاح لا من محتواه: KEYS واحد لكل رمز بدل GET لكل
+    مفتاح. مفتاح بلاحقة غير رقمية يُتجاهل بدل أن يُسقط الدخول كله.
+    """
+    newest = 0
+    for key in ex.redis_keys(journal_pattern(symbol, dry)):
+        try:
+            stamp = int(key.rsplit(":", 1)[-1])
+        except (TypeError, ValueError):
+            logger.warning("liq journal key with no timestamp: %s", key)
+            continue
+        newest = max(newest, stamp)
+    return newest
 
 
 def _journal_entry(record: dict[str, Any]) -> dict[str, Any]:
@@ -774,6 +839,25 @@ def process_entries(
                 result["skipped"].append({"symbol": symbol, "reason": "cooldown"})
                 continue
 
+            # الحارس الثالث: التهدئة مفتاح واحد، وغيابه لأي سبب يفتح الرمز
+            # فوراً. سجل الدخول عائلة مفاتيح منفصلة، فهو يمنع الدخول المكرّر
+            # حتى لو اختفت التهدئة. لا يستبدلها: التهدئة أرخص (GET واحد) وهي
+            # من تمنع في الحالة الطبيعية.
+            entered_at = _last_journal_entry(ex, symbol, dry=dry)
+            if entered_at and now - entered_at < COOLDOWN_SECONDS:
+                result["skipped"].append({
+                    "symbol": symbol,
+                    "reason": "recent_entry_in_journal",
+                    "entered_at": entered_at,
+                    "entered_at_iso": _iso(entered_at),
+                })
+                result["messages"].append(warn_message(
+                    f"تخطّي {symbol}: سجل الدخول يحمل دخولاً في "
+                    f"{_iso(entered_at)} (أقل من 24 ساعة) بينما مفتاح التهدئة "
+                    f"غير موجود — تحقّق من حالة Redis"
+                ))
+                continue
+
             foreign = _foreign_position(ex, symbol)
             if foreign:
                 result["skipped"].append({"symbol": symbol, "reason": f"foreign_{foreign}"})
@@ -795,7 +879,31 @@ def process_entries(
                 ))
                 continue
 
-            record = _open_position(ex, signal, now=now, dry=dry, amount=amount)
+            # الحجز الذرّي، آخر خطوة قبل الشراء. كل الفحوص فوقه "اقرأ ثم
+            # اكتب": بين قراءة open_key وكتابته في _open_position توجد نافذة
+            # تمرّ منها نبضتان متوازيتان معاً فتشتريان نفس الرمز مرتين — وهذا
+            # مثبّت في tests/test_liq_flush.py::test_two_concurrent_entries...
+            # SET NX أمر واحد ذرّي في Redis، فواحدة فقط تكسب الحجز.
+            # يُؤخذ بعد فحص الرصيد لا قبله حتى لا يُحجز رمز سيُتخطّى أصلاً.
+            if not ex.redis_set_json(
+                reserve_key(symbol, dry),
+                {"since": now},
+                ex_seconds=ENTRY_RESERVE_SECONDS,
+                nx=True,
+            ):
+                result["skipped"].append({"symbol": symbol, "reason": "entry_reserved"})
+                continue
+
+            try:
+                record = _open_position(ex, signal, now=now, dry=dry, amount=amount)
+            except Exception:
+                # تحرير الحجز عند فشل الشراء: وإلا بقي الرمز محجوزاً بلا مركز
+                # حتى تنتهي المهلة، فتضيع إشارة صالحة في النبضة القادمة.
+                # النجاح لا يحرّره: open_key والتهدئة وسجل الدخول تتولّى المنع
+                # بعدها، والحجز ينتهي وحده بمهلته.
+                ex.redis_delete(reserve_key(symbol, dry))
+                raise
+
             open_count += 1
 
             result["entries"].append({
@@ -870,6 +978,17 @@ def run_tick(ex: Any, params: dict[str, Any] | None = None) -> dict[str, Any]:
         now = int(override_now)
         result["time"] = now
         result["time_iso"] = _iso(now)
+
+    # بصمة "النبضة وصلت المنفّذ". أسوأ أنواع الفشل هو الذي لا يظهر في أي سجل:
+    # ثلاث نبضات في 2026-10-08 ما وصلت الحاوية أصلاً (خطأ DNS في عقدة n8n)،
+    # فلا رسالة ولا صف ولا خطأ في errors[] — صمت تام. /liq_health يقرأ هذه
+    # البصمة ويقيس عمرها، فيصير الصمت قابلاً للكشف من الخارج.
+    # قبل المفتاح القاتل وقبل القفل: نبضة معطّلة أو مكرّرة وصلت فعلاً، وهذا
+    # بالضبط ما نقيسه. وفشل الكتابة لا يُسقط النبضة — البصمة ليست الوظيفة.
+    try:
+        ex.redis_set_json(last_tick_key(dry), {"at": now, "at_iso": _iso(now)})
+    except Exception:  # noqa: BLE001
+        logger.exception("liq last_tick stamp failed")
 
     if not enabled:
         # المفتاح القاتل لا يهجر المراكز المفتوحة: مركز بلا خروج يبقى مفتوحاً
@@ -950,6 +1069,54 @@ def run_tick(ex: Any, params: dict[str, Any] | None = None) -> dict[str, Any]:
             logger.exception("liq tick lock release failed")
 
     return result
+
+
+def health(ex: Any) -> dict[str, Any]:
+    """قراءة فقط: هل النبضة الساعية تصل المنفّذ فعلاً؟
+
+    لا تنادي Bybit ولا تلمس أي مركز — مفتاح Redis واحد فقط، فتصلح للنداء
+    المتكرّر من مراقب خارجي بدون أن تنفق من حدود Bybit.
+
+    stale = فات وقت نبضة كاملة ونصف بلا أن تصل أي نبضة. last_tick_at = null
+    يعني أنه لم تصل نبضة واحدة منذ آخر إقلاع لـ Redis، وهو أيضاً stale.
+    """
+    dry = is_dry_run()
+    now = int(time.time())
+    out: dict[str, Any] = {
+        "strategy": STRATEGY,
+        "dry_run": dry,
+        "enabled": is_enabled(),
+        "now": now,
+        "now_iso": _iso(now),
+        "expected_interval_minutes": TICK_INTERVAL_MINUTES,
+        "stale_after_minutes": STALE_AFTER_MINUTES,
+        "last_tick_at": None,
+        "last_tick_at_iso": None,
+        "last_tick_age_minutes": None,
+        "stale": True,
+    }
+
+    try:
+        record = ex.redis_get_json(last_tick_key(dry))
+    except Exception as exc:  # noqa: BLE001 — المسار لا يرمي، يُبلّغ
+        out["error"] = str(exc)
+        return out
+
+    if not record:
+        return out
+
+    try:
+        at = int(record["at"])
+    except (KeyError, TypeError, ValueError) as exc:
+        out["error"] = f"malformed last_tick record: {exc}"
+        return out
+
+    age = round((now - at) / 60, 2)
+    out["last_tick_at"] = at
+    out["last_tick_at_iso"] = _iso(at)
+    out["last_tick_age_minutes"] = age
+    out["stale"] = age > STALE_AFTER_MINUTES
+    return out
 
 
 def list_positions(ex: Any) -> dict[str, Any]:

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
@@ -280,8 +281,12 @@ def test_cooldown_blocks_reentry_within_24h(ex):
     assert result["skipped"] == [{"symbol": "SOLUSDT", "reason": "cooldown"}]
     assert len(ex.buys) == 1
 
-    # once the TTL has expired the symbol is eligible again
+    # once the TTLs have expired the symbol is eligible again. The fake records
+    # TTLs without enforcing them, so expiry is spelled out: 25h is long past
+    # both the cooldown (24h) and the entry reservation (10 min), and the
+    # journal entry is older than 24h so it no longer blocks.
     ex.redis_delete(liq_flush.cooldown_key("SOLUSDT", False))
+    ex.redis_delete(liq_flush.reserve_key("SOLUSDT", False))
     liq_flush.process_entries(ex, _blank(), [sig("SOLUSDT")], now=T0 + 25 * HOUR, dry=False)
     assert len(ex.buys) == 2
 
@@ -838,6 +843,311 @@ def test_defaults_are_off(monkeypatch):
     assert liq_flush.is_enabled() is False
     assert liq_flush.is_dry_run() is False
     assert liq_flush.usdt_per_trade() == Decimal("10")
+
+
+# ============================================================
+# the double entry of 2026-10-07
+# ============================================================
+# ATOMUSDT reported "bought" twice 74 seconds apart (n8n executions 109694 and
+# 109695), both with skipped == []. These tests pin down which paths can and
+# cannot produce that, so the next occurrence is diagnosable instead of
+# re-litigated. The sequential path -- the one that actually ran in
+# production -- is blocked and was blocked then too, so the production cause is
+# NOT established by these tests; see test_wiping_the_two_guards_is_the_only...
+
+def test_a_second_tick_74_seconds_later_is_blocked_as_already_open(ex, monkeypatch):
+    """The exact production shape: two full ticks, same forced signal, 74s apart."""
+    monkeypatch.setenv("LIQ_DRY_RUN", "true")
+    first = liq_flush.run_tick(ex, {"force_signals": [sig("ATOMUSDT")], "now": T0})
+    second = liq_flush.run_tick(ex, {"force_signals": [sig("ATOMUSDT")], "now": T0 + 74})
+
+    assert first["entries"][0]["status"] == "bought"
+    # the tick lock is released in run_tick's finally, so it is NOT what stops
+    # the second tick -- already_open is
+    assert second["status"] == "ok"
+    assert second["entries"] == []
+    assert second["skipped"] == [{"symbol": "ATOMUSDT", "reason": "already_open"}]
+
+
+def test_wiping_the_two_guards_reproduces_the_production_signature(ex, monkeypatch):
+    """Deleting open: + cooldown: is the ONLY sequence found that yields a second
+    "bought" with skipped == [] -- the signature the live run showed.
+
+    It is consistent with a manual Redis cleanup between the two forced tests
+    (the first one's Sheets node had failed), but it is NOT proof: nothing in
+    Redis or the n8n log records who deleted what. The journal guard below
+    exists so that this sequence can no longer end in a buy.
+    """
+    monkeypatch.setenv("LIQ_DRY_RUN", "true")
+    liq_flush.run_tick(ex, {"force_signals": [sig("ATOMUSDT")], "now": T0})
+    ex.redis_delete(liq_flush.open_key("ATOMUSDT", True))
+    ex.redis_delete(liq_flush.cooldown_key("ATOMUSDT", True))
+
+    out = liq_flush.run_tick(ex, {"force_signals": [sig("ATOMUSDT")], "now": T0 + 74})
+
+    # the journal survives the wipe and now refuses the entry
+    assert out["entries"] == []
+    assert out["skipped"][0]["reason"] == "recent_entry_in_journal"
+    assert out["skipped"][0]["entered_at"] == T0
+    assert "سجل الدخول" in out["messages"][0]
+
+
+def test_two_concurrent_entries_buy_the_symbol_only_once(monkeypatch):
+    """The real race: every guard is read-then-write, so two parallel ticks can
+    both clear them and both buy. Redis executes each command atomically, so
+    the fake locks per command -- the window is BETWEEN commands, which is
+    exactly what SET NX closes.
+    """
+    monkeypatch.setenv("LIQ_DRY_RUN", "false")
+    command = threading.Lock()
+    reserve = liq_flush.reserve_key("ATOMUSDT", False)
+    both_attempted = threading.Barrier(2, timeout=10)
+
+    class AtomicRedis(FakeExecutor):
+        def redis_set_json(self, key, value, *, ex_seconds=None, nx=False):
+            with command:
+                got = super().redis_set_json(key, value, ex_seconds=ex_seconds, nx=nx)
+            if key == reserve:
+                # The reservation is the first write process_entries makes, so
+                # holding both threads just after their attempt freezes the
+                # winner before it can write open_key. The loser therefore
+                # reads the same pre-entry state the winner did and clears
+                # every read-then-write guard -- the window the live code has.
+                # Deterministic in both directions: whoever wins blocks here
+                # too, so neither can race ahead of the other.
+                both_attempted.wait()
+            return got
+
+        def redis_get_json(self, key):
+            with command:
+                return super().redis_get_json(key)
+
+        def redis_delete(self, key):
+            with command:
+                return super().redis_delete(key)
+
+        def redis_keys(self, pattern):
+            with command:
+                return super().redis_keys(pattern)
+
+    ex = AtomicRedis()
+    results = []
+
+    def one_tick():
+        out = _blank()
+        liq_flush.process_entries(ex, out, [sig("ATOMUSDT")], now=T0, dry=False)
+        results.append(out)
+
+    threads = [threading.Thread(target=one_tick) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+    assert not any(t.is_alive() for t in threads), "a thread never finished"
+
+    # one buy, not two
+    assert len(ex.buys) == 1
+    bought = [e for r in results for e in r["entries"]]
+    reserved = [s for r in results for s in r["skipped"]]
+    assert len(bought) == 1
+    assert reserved == [{"symbol": "ATOMUSDT", "reason": "entry_reserved"}]
+
+
+def test_reservation_blocks_an_entry_while_a_buy_is_in_flight(ex):
+    """Non-threaded form of the same guard: a live reservation means another
+    worker is mid-buy, so this tick must not add a second order."""
+    ex.store[liq_flush.reserve_key("SOLUSDT", False)] = {"since": T0 - 5}
+
+    result = _blank()
+    liq_flush.process_entries(ex, result, [sig("SOLUSDT")], now=T0, dry=False)
+
+    assert ex.buys == []
+    assert result["skipped"] == [{"symbol": "SOLUSDT", "reason": "entry_reserved"}]
+
+
+def test_reservation_is_released_when_the_buy_fails(ex):
+    """A failed buy must not leave the symbol locked out: the signal has to be
+    takeable on the next tick."""
+    ex.raise_on_price.add("SOLUSDT")  # dry path reads the ticker and raises
+
+    result = _blank()
+    liq_flush.process_entries(ex, result, [sig("SOLUSDT")], now=T0, dry=True)
+
+    assert result["errors"][0]["stage"] == "entry"
+    assert liq_flush.reserve_key("SOLUSDT", True) not in ex.store
+
+    # and the next tick can take it
+    ex.raise_on_price.clear()
+    liq_flush.process_entries(ex, _blank(), [sig("SOLUSDT")], now=T0 + 60, dry=True)
+    assert liq_flush.open_key("SOLUSDT", True) in ex.store
+
+
+def test_reservation_has_a_ttl_so_a_dead_worker_cannot_block_forever(ex):
+    liq_flush.process_entries(ex, _blank(), [sig("SOLUSDT")], now=T0, dry=False)
+    assert ex.ttl[liq_flush.reserve_key("SOLUSDT", False)] == liq_flush.ENTRY_RESERVE_SECONDS
+    assert liq_flush.ENTRY_RESERVE_SECONDS < liq_flush.COOLDOWN_SECONDS
+
+
+def test_journal_is_written_on_entry_and_outlives_the_cooldown(ex):
+    liq_flush.process_entries(ex, _blank(), [sig("SOLUSDT")], now=T0, dry=False)
+
+    key = liq_flush.journal_key("SOLUSDT", T0, False)
+    assert ex.store[key]["entered"] == T0
+    # longer than the cooldown on purpose: it is the guard that must still be
+    # there when the cooldown key is not
+    assert ex.ttl[key] == liq_flush.ENTRY_JOURNAL_SECONDS
+    assert liq_flush.ENTRY_JOURNAL_SECONDS > liq_flush.COOLDOWN_SECONDS
+
+
+def test_journal_lets_the_symbol_back_in_after_24h(ex):
+    liq_flush.process_entries(ex, _blank(), [sig("SOLUSDT")], now=T0, dry=False)
+    # the wipe this guard exists for, plus the reservation whose 10-minute TTL
+    # has long passed at the times used below (the fake does not enforce TTLs)
+    ex.redis_delete(liq_flush.open_key("SOLUSDT", False))
+    ex.redis_delete(liq_flush.cooldown_key("SOLUSDT", False))
+    ex.redis_delete(liq_flush.reserve_key("SOLUSDT", False))
+
+    # one second short of 24h: still refused
+    blocked = _blank()
+    liq_flush.process_entries(ex, blocked, [sig("SOLUSDT")], now=T0 + 24 * HOUR - 1, dry=False)
+    assert blocked["skipped"][0]["reason"] == "recent_entry_in_journal"
+    assert len(ex.buys) == 1
+
+    # exactly 24h: eligible again, same boundary as the cooldown
+    ex.redis_delete(liq_flush.reserve_key("SOLUSDT", False))
+    liq_flush.process_entries(ex, _blank(), [sig("SOLUSDT")], now=T0 + 24 * HOUR, dry=False)
+    assert len(ex.buys) == 2
+
+
+def test_journal_of_one_symbol_does_not_block_another(ex):
+    liq_flush.process_entries(ex, _blank(), [sig("SOLUSDT")], now=T0, dry=False)
+
+    result = _blank()
+    liq_flush.process_entries(ex, result, [sig("ETCUSDT")], now=T0 + 60, dry=False)
+    assert result["skipped"] == []
+    assert [s for s, *_ in ex.buys] == ["SOLUSDT", "ETCUSDT"]
+
+
+def test_journal_keeps_the_dry_and_live_prefixes_apart(ex):
+    liq_flush.process_entries(ex, _blank(), [sig("SOLUSDT")], now=T0, dry=True)
+
+    # a paper entry must not block a live one -- different prefix entirely
+    result = _blank()
+    liq_flush.process_entries(ex, result, [sig("SOLUSDT")], now=T0 + 60, dry=False)
+    assert result["skipped"] == []
+    assert liq_flush.journal_key("SOLUSDT", T0, True) in ex.store
+    assert liq_flush.journal_key("SOLUSDT", T0, False) not in ex.store
+
+
+def test_a_malformed_journal_key_does_not_block_the_entry(ex):
+    """KEYS is a pattern match; a stray key must not take the strategy down."""
+    ex.store[f"{liq_flush._prefix(False)}:journal:SOLUSDT:not-a-number"] = {}
+
+    result = _blank()
+    liq_flush.process_entries(ex, result, [sig("SOLUSDT")], now=T0, dry=False)
+    assert result["skipped"] == []
+    assert len(ex.buys) == 1
+
+
+# ============================================================
+# /liq_health -- is the hourly tick arriving at all?
+# ============================================================
+
+def test_health_reports_no_tick_before_the_first_one(ex, monkeypatch):
+    monkeypatch.setenv("LIQ_DRY_RUN", "true")
+    out = liq_flush.health(ex)
+    assert out["last_tick_at"] is None
+    assert out["last_tick_age_minutes"] is None
+    assert out["stale"] is True            # silence is stale, not healthy
+    assert out["dry_run"] is True
+
+
+def test_a_tick_stamps_its_arrival(ex, monkeypatch):
+    monkeypatch.setenv("LIQ_DRY_RUN", "true")
+    liq_flush.run_tick(ex, {"skip_scan": True, "now": T0})
+    assert ex.store[liq_flush.last_tick_key(True)]["at"] == T0
+
+
+def test_health_reports_the_age_in_minutes(ex, monkeypatch):
+    monkeypatch.setenv("LIQ_DRY_RUN", "true")
+    now = 1_760_000_600
+    monkeypatch.setattr(liq_flush.time, "time", lambda: now)
+    ex.store[liq_flush.last_tick_key(True)] = {"at": now - 25 * 60}
+
+    out = liq_flush.health(ex)
+    assert out["last_tick_age_minutes"] == 25.0
+    assert out["stale"] is False           # inside one hourly beat
+    assert out["expected_interval_minutes"] == 60
+
+
+def test_health_flags_a_tick_that_never_arrived(ex, monkeypatch):
+    """The 2026-10-08 DNS failures: the service answered fine and the strategy
+    was dead. Three missed hourly beats must read as stale."""
+    monkeypatch.setenv("LIQ_DRY_RUN", "true")
+    now = 1_760_000_600
+    monkeypatch.setattr(liq_flush.time, "time", lambda: now)
+    ex.store[liq_flush.last_tick_key(True)] = {"at": now - 3 * 60 * 60}
+
+    out = liq_flush.health(ex)
+    assert out["last_tick_age_minutes"] == 180.0
+    assert out["stale"] is True
+
+
+def test_health_is_read_only(ex, monkeypatch):
+    monkeypatch.setenv("LIQ_DRY_RUN", "true")
+    ex.store[liq_flush.last_tick_key(True)] = {"at": T0}
+    before = json.dumps(ex.store, sort_keys=True)
+
+    liq_flush.health(ex)
+    assert json.dumps(ex.store, sort_keys=True) == before
+    assert ex.buys == [] and ex.sells == []
+    assert ex.coin_balance_calls == []
+
+
+def test_health_survives_a_broken_record(ex, monkeypatch):
+    monkeypatch.setenv("LIQ_DRY_RUN", "true")
+    ex.store[liq_flush.last_tick_key(True)] = {"oops": 1}
+
+    out = liq_flush.health(ex)
+    assert "malformed" in out["error"]
+    assert out["stale"] is True
+
+
+def test_health_reads_the_prefix_it_runs_under(ex, monkeypatch):
+    """A paper stamp must not make the live strategy look alive."""
+    ex.store[liq_flush.last_tick_key(True)] = {"at": T0}
+
+    monkeypatch.setenv("LIQ_DRY_RUN", "false")
+    assert liq_flush.health(ex)["last_tick_at"] is None
+    monkeypatch.setenv("LIQ_DRY_RUN", "true")
+    assert liq_flush.health(ex)["last_tick_at"] == T0
+
+
+def test_a_disabled_tick_still_stamps_its_arrival(ex, monkeypatch):
+    """The kill switch stops trading, not the heartbeat: otherwise turning the
+    strategy off makes the monitor read as a dead executor."""
+    monkeypatch.setenv("LIQ_ENABLED", "false")
+    monkeypatch.setenv("LIQ_DRY_RUN", "true")
+
+    out = liq_flush.run_tick(ex, {"skip_scan": True, "now": T0})
+    assert out["status"].startswith("disabled")
+    assert ex.store[liq_flush.last_tick_key(True)]["at"] == T0
+
+
+def test_a_stamp_failure_does_not_break_the_tick(ex, monkeypatch):
+    """The stamp is diagnostics, never the job."""
+    monkeypatch.setenv("LIQ_DRY_RUN", "true")
+    real_set = ex.redis_set_json
+
+    def refuse_the_stamp(key, value, **kwargs):
+        if key == liq_flush.last_tick_key(True):
+            raise RuntimeError("Redis write failed")
+        return real_set(key, value, **kwargs)
+
+    monkeypatch.setattr(ex, "redis_set_json", refuse_the_stamp)
+    out = liq_flush.run_tick(ex, {"force_signals": [sig("SOLUSDT")], "now": T0})
+    assert out["status"] == "ok"
+    assert out["entries"][0]["status"] == "bought"
 
 
 # ============================================================
