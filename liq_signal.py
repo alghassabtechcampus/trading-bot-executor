@@ -5,7 +5,14 @@ liq_signal.py — كاشف إشارة "التصفيات الإجبارية" (ن�
   - شموع ساعة من Bybit (linear) + Open Interest ساعي
   - r4  = تغير السعر خلال 4 ساعات   | oi4 = تغير الـ OI خلال 4 ساعات
   - z محسوب على آخر 720 ساعة (30 يوم) — الماضي فقط
-  - إشارة: z_r4 <= -3  و  z_oi4 <= -3   (على آخر شمعة مغلقة)
+  - إشارة: z_r4 <= -3  و  z_oi4 <= -3
+
+تُفحص آخر EVAL_BARS شمعة مغلقة لا آخر واحدة فقط. السبب: الإشارة تُقرأ في النبضة
+التي تلي إغلاق الشمعة، فنبضة فاشلة واحدة كانت تعني إشارة ضائعة للأبد — وهذا حصل
+فعلاً: إشارة AVAX على شمعة 2026-10-08 17:00 ضاعت لأن نبضة 18:02 فشلت بخطأ DNS
+(handoff/LIQ_STATUS_CHECK_AR.md). الخروج يلحق نفسه لأنه يقارن طوابع زمنية مطلقة،
+أما الدخول فلا. كل إشارة تحمل late_bars = كم شمعة تأخّرت (0 = آخر شمعة مغلقة)،
+و liq_flush يرفض الدخول إذا تجاوز عمر شمعة الإشارة MAX_SIGNAL_AGE_SECONDS.
 
 الاستخدام:
   python liq_signal.py          → يطبع حالة كل العملات الآن (فحص يدوي بدون تداول)
@@ -27,6 +34,10 @@ Z_WIN = 720
 LOOKBACK = 4
 Z_THRESH = -3.0
 BARS = Z_WIN + 60          # كم شمعة نسحب
+# كم شمعة مغلقة نفحص في كل نبضة. 2 = آخر شمعة والتي قبلها، فنبضة فاشلة واحدة
+# تلحقها النبضة التالية. لا تُزاد بلا سبب: كل شمعة إضافية تعني السماح بإشارة
+# أقدم، وحد العمر في liq_flush يرفضها أصلاً.
+EVAL_BARS = 2
 
 
 def _get(path, params):
@@ -77,34 +88,53 @@ def fetch(sym):
     return df[df.index < now_hour]            # نشيل الشمعة اللي لسا مفتوحة
 
 
-def evaluate(df):
-    """يحسب z لآخر شمعة مغلقة. نفس معادلات الاختبار حرفياً."""
+def evaluate(df, offset=0):
+    """يحسب z لشمعة مغلقة واحدة. نفس معادلات الاختبار حرفياً.
+
+    offset=0 آخر شمعة مغلقة، offset=1 التي قبلها. متوسط النافذة وانحرافها
+    مُزاحان بـ shift(1) أي من ماضي الشمعة وحده، فقيمة z للشمعة الأقدم هي نفسها
+    التي كانت ستُحسب لها في نبضتها — لا تتغيّر بمرور الوقت ولا تنظر للمستقبل.
+    """
     df = df.copy()
     df["r4"] = df["close"] / df["close"].shift(LOOKBACK) - 1
     df["oi4"] = df["oi"] / df["oi"].shift(LOOKBACK) - 1
+    i = -1 - offset
     out = {}
     for c in ["r4", "oi4"]:
         m = df[c].rolling(Z_WIN, min_periods=Z_WIN // 2).mean().shift(1)
         s = df[c].rolling(Z_WIN, min_periods=Z_WIN // 2).std().shift(1)
-        out["z_" + c] = ((df[c] - m) / s).iloc[-1]
-    last = df.iloc[-1]
-    return dict(bar=df.index[-1], close=float(last["close"]),
-                r4=float(df["r4"].iloc[-1]), oi4=float(df["oi4"].iloc[-1]),
+        out["z_" + c] = ((df[c] - m) / s).iloc[i]
+    last = df.iloc[i]
+    return dict(bar=df.index[i], close=float(last["close"]),
+                r4=float(df["r4"].iloc[i]), oi4=float(df["oi4"].iloc[i]),
                 z_r4=float(out["z_r4"]), z_oi4=float(out["z_oi4"]),
+                late_bars=offset,
                 signal=bool(out["z_r4"] <= Z_THRESH and out["z_oi4"] <= Z_THRESH))
 
 
-def scan(symbols=SYMBOLS):
-    """يرجع (كل النتائج، الإشارات فقط) مرتبة من الأقوى."""
-    rows = []
+def scan(symbols=SYMBOLS, eval_bars=EVAL_BARS):
+    """يرجع (كل النتائج، الإشارات فقط) مرتبة من الأقوى.
+
+    rows: صف واحد لكل رمز من **آخر شمعة مغلقة**. هذا ما يقيسه scan.checked في
+    liq_flush، فعدده يساوي عدد الرموز دائماً مهما كان eval_bars.
+    sigs: الإشارات على آخر eval_bars شمعة، بإشارة واحدة لكل رمز على الأكثر —
+    لو أشارت الشمعتان فهما نفس حدث التصفية، فنأخذ الأحدث (late_bars الأصغر)
+    ونرمي الأقدم هنا بدل الاعتماد على التهدئة لتصفية التكرار لاحقاً.
+    """
+    rows, sigs = [], []
     for s in symbols:
         try:
-            r = evaluate(fetch(s))
-            r["symbol"] = s
-            rows.append(r)
+            df = fetch(s)
+            bars = max(1, min(eval_bars, len(df)))
+            evals = [evaluate(df, offset) for offset in range(bars)]
+            for r in evals:
+                r["symbol"] = s
+            rows.append(evals[0])
+            hit = next((r for r in evals if r["signal"]), None)
+            if hit is not None:
+                sigs.append(hit)
         except Exception as e:  # noqa
             rows.append(dict(symbol=s, error=str(e), signal=False))
-    sigs = [r for r in rows if r.get("signal")]
     sigs.sort(key=lambda r: r["z_r4"] + r["z_oi4"])   # الأكثر تطرفاً أولاً
     return rows, sigs
 
@@ -118,4 +148,8 @@ if __name__ == "__main__":
             continue
         print(f"{r['symbol']:10} {r['bar']:%Y-%m-%d %H:%M} {r['r4']*100:7.2f} {r['oi4']*100:7.2f} "
               f"{r['z_r4']:6.2f} {r['z_oi4']:6.2f}  {'🔔 YES' if r['signal'] else '-'}")
+    for s in sigs:
+        late = f"  ⏱ متأخرة {s['late_bars']} شمعة" if s.get("late_bars") else ""
+        print(f"  🔔 {s['symbol']:10} شمعة {s['bar']:%Y-%m-%d %H:%M} "
+              f"z {s['z_r4']:.2f}/{s['z_oi4']:.2f}{late}")
     print(f"\nإشارات الآن: {len(sigs)}")

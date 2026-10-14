@@ -503,9 +503,14 @@ def test_dust_below_min_order_writes_an_exit_row_instead_of_vanishing(ex):
     assert any("ما انباعت" in m and "0.00001" in m for m in result["messages"])
 
 
-def test_dust_exit_row_keeps_the_eighteen_sheet_keys(ex):
-    """The liq_flush tab is 18 fixed columns (A1:R1). An unsold row must not
-    widen the schema, or n8n's Sheets mapping breaks on deploy."""
+def test_dust_exit_row_keeps_the_nineteen_sheet_keys(ex):
+    """The liq_flush tab is 19 fixed columns (A1:S1) -- 18 plus late_bars, added
+    when the signal catch-up landed. An unsold row must not widen the schema, or
+    n8n's Sheets mapping breaks on deploy.
+
+    If this number ever changes again, the tab's header row has to change with
+    it: n8n maps by header name, so a field with no column is dropped silently.
+    """
     _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0, qty="0.00001")
     ex.wallet = Decimal("0.00001")
     ex.klines["SOLUSDT"] = []
@@ -519,7 +524,7 @@ def test_dust_exit_row_keeps_the_eighteen_sheet_keys(ex):
     liq_flush.process_exits(ex, normal, now=T0 + 24 * HOUR, dry=False)
 
     assert set(result["journal"][0]) == set(normal["journal"][0])
-    assert len(result["journal"][0]) == 18
+    assert len(result["journal"][0]) == 19
 
 
 def test_balance_far_below_expected_is_not_deleted_and_warns(ex):
@@ -1047,6 +1052,243 @@ def test_a_malformed_journal_key_does_not_block_the_entry(ex):
     liq_flush.process_entries(ex, result, [sig("SOLUSDT")], now=T0, dry=False)
     assert result["skipped"] == []
     assert len(ex.buys) == 1
+
+
+# ============================================================
+# the missed signal of 2026-10-08
+# ============================================================
+# AVAXUSDT signalled on the 17:00 bar. The 18:02 tick -- the only tick that
+# would ever look at that bar -- died with a DNS error, so the signal was lost
+# for good while the 19:02 tick ran fine and left no trace of the loss.
+# liq_signal now evaluates the last TWO closed bars and tags each signal with
+# late_bars; these tests pin down that the catch-up enters once and no more,
+# and that it refuses a signal too old to still be the same trade.
+
+def _late_sig(symbol, *, bar, late_bars, z=-3.5, close="100"):
+    return {"symbol": symbol, "close": close, "z_r4": z, "z_oi4": z - 0.1,
+            "bar": bar, "late_bars": late_bars}
+
+
+def _bar(stamp):
+    """ISO string for the hour bar OPENING at `stamp` (what Bybit returns)."""
+    return liq_flush._iso(stamp)
+
+
+def test_a_missed_tick_is_caught_up_on_the_next_tick(ex):
+    """The 2026-10-08 case, start to finish: the bar closed an hour ago because
+    the tick that should have seen it never ran. Entering it late is the whole
+    point -- but the row must say so, or the live log cannot be compared with a
+    backtest that always enters at the next bar's open."""
+    bar_open = T0                      # bar 17:00, closes at T0 + 1h
+    now = T0 + 2 * HOUR + 120          # the 19:02 tick: 1h02m after the close
+
+    result = _blank()
+    liq_flush.process_entries(
+        ex, result, [_late_sig("AVAXUSDT", bar=_bar(bar_open), late_bars=1)],
+        now=now, dry=False,
+    )
+
+    assert result["skipped"] == []
+    assert len(ex.buys) == 1 and ex.buys[0][0] == "AVAXUSDT"
+    assert result["entries"][0]["late_bars"] == 1
+
+    # it has to survive into the record, because the exit row is written 24h
+    # later when the signal itself is long gone
+    record = ex.store[liq_flush.open_key("AVAXUSDT", False)]
+    assert record["late_bars"] == 1
+    assert record["signal_bar"] == _bar(bar_open)
+
+    row = result["journal"][0]
+    assert row["event"] == "entry" and row["late_bars"] == 1
+
+    # and the person reading Telegram learns it was a catch-up, not a fresh entry
+    assert any("AVAXUSDT" in m and "1" in m for m in result["messages"])
+
+
+def test_the_caught_up_signal_is_entered_once_even_though_it_scans_twice(ex):
+    """A two-bar window means the SAME bar is offered twice: as late_bars=0 on
+    the tick after it closes, then as late_bars=1 on the tick after that. The
+    second offer must not buy again."""
+    bar_open = T0
+    fresh_tick = T0 + HOUR + 120       # bar seen as the last closed bar
+    next_tick = T0 + 2 * HOUR + 120    # same bar, now one bar old
+
+    first = _blank()
+    liq_flush.process_entries(
+        ex, first, [_late_sig("AVAXUSDT", bar=_bar(bar_open), late_bars=0)],
+        now=fresh_tick, dry=False,
+    )
+    assert len(ex.buys) == 1
+    assert first["entries"][0]["late_bars"] == 0
+
+    second = _blank()
+    liq_flush.process_entries(
+        ex, second, [_late_sig("AVAXUSDT", bar=_bar(bar_open), late_bars=1)],
+        now=next_tick, dry=False,
+    )
+
+    # one buy, total, and the skip says which guard caught it
+    assert len(ex.buys) == 1, "the overlapping scan window bought the bar twice"
+    assert second["entries"] == []
+    assert second["journal"] == []
+    assert second["skipped"][0]["reason"] == "already_open"
+
+
+def test_the_catch_up_is_still_blocked_by_cooldown_after_the_position_closed(ex):
+    """already_open is not the only guard that matters: a trade that opened and
+    closed inside the overlap window leaves no open key, and only the cooldown
+    and the entry journal stand between the second offer and a second buy."""
+    bar_open = T0
+    liq_flush.process_entries(
+        ex, _blank(), [_late_sig("AVAXUSDT", bar=_bar(bar_open), late_bars=0)],
+        now=T0 + HOUR + 120, dry=False,
+    )
+    assert len(ex.buys) == 1
+
+    # the position is gone (sold, or cleared by hand) but the cooldown remains
+    ex.redis_delete(liq_flush.open_key("AVAXUSDT", False))
+
+    result = _blank()
+    liq_flush.process_entries(
+        ex, result, [_late_sig("AVAXUSDT", bar=_bar(bar_open), late_bars=1)],
+        now=T0 + 2 * HOUR + 120, dry=False,
+    )
+    assert len(ex.buys) == 1
+    assert result["skipped"][0]["reason"] == "cooldown"
+
+
+def test_catch_up_refuses_a_signal_whose_bar_is_too_old(ex):
+    """Several ticks in a row can fail (three did on 2026-10-08). Past two hours
+    the flush has already played out, so entering is a different trade from the
+    one the backtest measured -- refuse it and say so."""
+    bar_open = T0                               # closes T0 + 1h
+    now = T0 + 1 * HOUR + liq_flush.MAX_SIGNAL_AGE_SECONDS + 60
+
+    result = _blank()
+    liq_flush.process_entries(
+        ex, result, [_late_sig("AVAXUSDT", bar=_bar(bar_open), late_bars=1)],
+        now=now, dry=False,
+    )
+
+    assert ex.buys == []
+    assert result["entries"] == []
+    skip = result["skipped"][0]
+    assert skip["reason"] == "signal_too_old"
+    assert skip["late_bars"] == 1
+    assert skip["age_minutes"] == pytest.approx(121, abs=1)
+    assert any("AVAXUSDT" in m for m in result["messages"])
+
+
+def test_the_age_limit_is_measured_from_the_bar_close_not_its_open(ex):
+    """An hour bar opening at 17:00 only becomes knowable at 18:00. Measuring the
+    age from the open would reject the normal one-tick catch-up as 2h01m old."""
+    bar_open = T0
+    # exactly at the limit measured from the close: 1h (bar) + 2h (limit)
+    at_limit = T0 + HOUR + liq_flush.MAX_SIGNAL_AGE_SECONDS
+
+    result = _blank()
+    liq_flush.process_entries(
+        ex, result, [_late_sig("AVAXUSDT", bar=_bar(bar_open), late_bars=1)],
+        now=at_limit, dry=False,
+    )
+    assert len(ex.buys) == 1, "the boundary itself must be allowed"
+    assert result["skipped"] == []
+
+
+def test_an_unreadable_bar_is_refused_when_late_but_not_when_fresh(ex):
+    """A signal whose age cannot be established is worse than a missed one, so
+    the late path refuses it. The fresh path keeps working: force_signals is
+    hand-written and its bar has never been required to parse."""
+    result = _blank()
+    liq_flush.process_entries(
+        ex, result, [_late_sig("AVAXUSDT", bar="whenever", late_bars=1)],
+        now=T0, dry=False,
+    )
+    assert ex.buys == []
+    assert result["skipped"][0]["reason"] == "signal_too_old"
+    assert result["skipped"][0]["age_minutes"] is None
+
+    fresh = _blank()
+    liq_flush.process_entries(
+        ex, fresh, [_late_sig("SOLUSDT", bar="whenever", late_bars=0)],
+        now=T0, dry=False,
+    )
+    assert len(ex.buys) == 1
+    assert fresh["skipped"] == []
+
+
+def test_a_signal_with_no_late_bars_field_is_treated_as_fresh(ex):
+    """Every force_signals payload ever sent by hand omits late_bars, and the
+    live overrides are documented in handoff/LIQ_FLUSH_AR.md. Omitting it must
+    mean "the last closed bar", not "unknown age, refuse"."""
+    result = _blank()
+    liq_flush.process_entries(ex, result, [sig("SOLUSDT")], now=T0, dry=False)
+    assert len(ex.buys) == 1
+    assert result["entries"][0]["late_bars"] == 0
+    assert result["journal"][0]["late_bars"] == 0
+
+
+def test_late_bars_reaches_the_exit_row_a_day_later(ex):
+    """The exit row is the one that gets compared with the backtest, and by the
+    time it is written the signal is 24h gone -- so late_bars has to travel in
+    the open record, not be recomputed."""
+    bar_open = T0
+    liq_flush.process_entries(
+        ex, _blank(), [_late_sig("SOLUSDT", bar=_bar(bar_open), late_bars=1)],
+        now=T0 + 2 * HOUR, dry=False,
+    )
+    ex.klines["SOLUSDT"] = []
+
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + 26 * HOUR + 1, dry=False)
+
+    row = result["journal"][0]
+    assert row["event"] == "exit"
+    assert row["late_bars"] == 1
+
+
+# ============================================================
+# the 25-hour hold of 2026-10-08
+# ============================================================
+# ETCUSDT entered at 19:02:11 because the request reached the executor four
+# seconds after n8n started the run. The next day's tick arrived at 19:02:07 --
+# four seconds short of 24h -- so the strict >= missed and the position sat for
+# another full hour. HOLD_TOLERANCE_SECONDS closes that gap.
+
+def test_time_exit_fires_when_the_tick_lands_seconds_short_of_24h(ex):
+    """The exact 2026-10-08 ETCUSDT shape: entry stamped a few seconds into the
+    tick, next day's tick a few seconds earlier than that."""
+    _seed_open(ex, "ETCUSDT", entry_price="100", entry_time=T0 + 4)
+    ex.klines["ETCUSDT"] = []
+
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + 24 * HOUR, dry=False)
+
+    assert result["exits"][0]["reason"] == "time", "a 4-second miss cost a full hour"
+    assert ex.sells[0][0] == "ETCUSDT"
+
+
+def test_the_tolerance_cannot_pull_the_exit_a_whole_tick_early(ex):
+    """The tolerance exists to stop a seconds-wide miss, not to shorten the hold.
+    It must stay far below the hour between two ticks, or the exit moves to the
+    23:02 tick and the live hold is an hour short of the backtest's 24."""
+    assert liq_flush.HOLD_TOLERANCE_SECONDS < 1800
+
+    _seed_open(ex, "SOLUSDT", entry_price="100", entry_time=T0)
+    ex.klines["SOLUSDT"] = []
+
+    # the tick an hour before the due time -- where the exit would land if the
+    # tolerance were anywhere near an hour wide
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + 23 * HOUR + 120, dry=False)
+    assert result["exits"][0]["status"] == "holding"
+    assert ex.sells == []
+
+    # and ten minutes short is still short: only a seconds-wide miss is forgiven
+    result = _blank()
+    liq_flush.process_exits(ex, result, now=T0 + 23 * HOUR + 50 * 60, dry=False)
+    assert result["exits"][0]["status"] == "holding"
+    assert ex.sells == []
 
 
 # ============================================================

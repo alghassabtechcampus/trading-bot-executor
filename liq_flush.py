@@ -6,6 +6,9 @@
   دخول : SPOT market BUY بـ LIQ_USDT_PER_TRADE لكل رمز في sigs، أقصى 3 لكل فحص
   خروج : بعد 24 ساعة من الدخول، أو وقف عند entry × 0.92 — أيهما أولاً
   حدود : أقصى 6 صفقات مفتوحة، وتهدئة 24 ساعة لكل رمز بعد دخوله
+  لحاق : liq_signal يفحص آخر شمعتين، فإشارة ضيّعتها نبضة فاشلة تُدخَل في
+         النبضة التالية بشرط أن يكون عمر شمعتها ≤ MAX_SIGNAL_AGE_SECONDS،
+         وتُسجَّل بـ late_bars=1 في الشيت
 
 الحالة كلها تحت بادئة liq: في Redis (liq:open:*, liq:cooldown:*, liq:closed:*)
 ولا تتقاطع مع trade:* / pending:* اللي تستخدمها الاستراتيجيات الأخرى، وكل أمر
@@ -50,6 +53,22 @@ MAX_OPEN = 6                      # أقصى عدد صفقات liq_flush مفت�
 COOLDOWN_SECONDS = 24 * 60 * 60   # لا نعيد دخول نفس الرمز قبل 24 ساعة
 HOLD_SECONDS = 24 * 60 * 60       # الخروج الزمني: 24 ساعة من الدخول
 STOP_FRACTION = Decimal("0.92")   # وقف الخسارة: −8% من سعر التنفيذ
+
+# تسامح الخروج الزمني. entry_time هو لحظة وصول الطلب إلى المنفّذ، وفيها تأخير
+# شبكة يزيد ثوانيَ عن بداية تشغيل n8n، بينما نبضة اليوم التالي تصل على نفس
+# الثانية من الساعة. فبلا تسامح يفوت شرط >= بثوانٍ قليلة ويبقى المركز مفتوحاً
+# نبضة كاملة إضافية: ETC في 2026-10-08 احتفظ 25.0 ساعة بدل 24 لتأخير 4 ثوان
+# (handoff/LIQ_STATUS_CHECK_AR.md). خمس دقائق أصغر بكثير من المسافة بين نبضتين،
+# فهي لا تقدر تُقدّم الخروج نبضة كاملة — تمنع تأخيره نبضة كاملة فقط.
+HOLD_TOLERANCE_SECONDS = 5 * 60
+
+# أقصى عمر مقبول لشمعة الإشارة وقت التنفيذ، يُقاس من **إغلاق** الشمعة.
+# liq_signal يفحص آخر شمعتين (EVAL_BARS) فنبضة فاشلة تلحقها النبضة التالية،
+# لكن إشارة قديمة لا تُدخَل: حركة التصفية تُستهلك بسرعة والباك-تيست يدخل عند
+# افتتاح الشمعة التالية مباشرة. ساعتان تكفيان لنبضة واحدة فائتة (اللحاق يحصل
+# بعد ~ساعة من الإغلاق) وترفض ما هو أقدم من ذلك.
+MAX_SIGNAL_AGE_SECONDS = 2 * 60 * 60
+BAR_SECONDS = 60 * 60             # شموع الإشارة ساعية
 
 # قفل التنفيذ المتزامن: n8n يعيد المحاولة عند أي timeout، والفحص يستغرق ~60 ثانية،
 # فبدون القفل تقدر محاولتان تدخلان نفس الإشارة مرتين.
@@ -187,6 +206,23 @@ def _num(value: Any) -> str:
     return str(value)
 
 
+def _bar_end_ts(bar: Any) -> int | None:
+    """لحظة إغلاق شمعة الإشارة بالثواني، أو None لو تعذّر تحليل النص.
+
+    bar من liq_signal هو وقت **افتتاح** الشمعة (هكذا ترجّعها Bybit)، وشمعة
+    17:00 تُغلق 18:00. فعمر الإشارة يُقاس من الإغلاق لأنه اللحظة التي صارت
+    فيها الإشارة معروفة أصلاً — القياس من الافتتاح يطرح ساعة كاملة بلا سبب
+    ويرفض لحاقاً صحيحاً.
+    """
+    if not isinstance(bar, str):
+        return None
+    try:
+        opened = datetime.strptime(bar, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return int(opened.timestamp()) + BAR_SECONDS
+
+
 def _round(value: Decimal, places: str) -> Decimal:
     """تقريب للعرض والتسجيل. القسمة في Decimal ترجّع 28 رقماً عشرياً، وصفٌّ مثل
     pnl_pct = 0.01655355073663300778016884622 في Google Sheet غير قابل للقراءة
@@ -210,9 +246,13 @@ def _fee_of(order: dict[str, Any]) -> Decimal:
 # Telegram الموجودة أصلاً — نفس نمط indicators/alert_watcher.py. فائدته أن
 # بيانات بوت تلغرام لا تدخل حاوية التنفيذ التي تحمل مفتاح Bybit.
 
-def buy_message(symbol: str, price: Decimal, z_r4: float, z_oi4: float) -> str:
+def buy_message(symbol: str, price: Decimal, z_r4: float, z_oi4: float,
+                late_bars: int = 0) -> str:
+    # الدخول المتأخر يُعلن صريحاً: إشارة لُحقت بعد نبضة فاشلة ليست نفس الدخول
+    # الفوري، ولازم تعرف ذلك وقت وصول الرسالة لا وقت مراجعة الشيت.
+    late = f" — ⏱ لحاق متأخر {late_bars} شمعة" if late_bars else ""
     return (f"🟢 شراء: {symbol} بسعر {_num(price)} — "
-            f"z سعر {z_r4:.1f} / z OI {z_oi4:.1f} — خروج بعد 24 ساعة أو وقف 8%")
+            f"z سعر {z_r4:.1f} / z OI {z_oi4:.1f} — خروج بعد 24 ساعة أو وقف 8%{late}")
 
 
 def sell_message(symbol: str, reason: str, pnl_pct: Decimal, pnl_usd: Decimal,
@@ -553,6 +593,7 @@ def _journal_exit(closed: dict[str, Any]) -> dict[str, Any]:
         "z_r4": closed.get("z_r4"),
         "z_oi4": closed.get("z_oi4"),
         "signal_bar": closed.get("signal_bar"),
+        "late_bars": closed.get("late_bars", 0),
         "dry_run": closed.get("dry_run", False),
     }
 
@@ -581,7 +622,7 @@ def process_exits(ex: Any, result: dict[str, Any], *, now: int, dry: bool) -> No
 
             if trigger_price <= stop_level:
                 reason = "stop"
-            elif age_seconds >= HOLD_SECONDS:
+            elif age_seconds >= HOLD_SECONDS - HOLD_TOLERANCE_SECONDS:
                 reason = "time"
             else:
                 result["exits"].append({
@@ -732,6 +773,10 @@ def _open_position(
         "signal_close": _num(signal.get("close")),
         "z_r4": float(signal["z_r4"]),
         "z_oi4": float(signal["z_oi4"]),
+        # كم شمعة تأخّر الدخول عن شمعة الإشارة. 0 = النبضة التي تلي الإغلاق
+        # مباشرة (الحالة الطبيعية)، 1 = لحاق بعد نبضة فاشلة. يُحفظ في السجل لا
+        # يُحسب لاحقاً، لأن صف الخروج يحتاجه بعد 24 ساعة من اختفاء الإشارة.
+        "late_bars": int(signal.get("late_bars") or 0),
         "dry_run": dry,
     }
 
@@ -794,6 +839,7 @@ def _journal_entry(record: dict[str, Any]) -> dict[str, Any]:
         "z_r4": record["z_r4"],
         "z_oi4": record["z_oi4"],
         "signal_bar": record["signal_bar"],
+        "late_bars": record.get("late_bars", 0),
         "dry_run": record["dry_run"],
     }
 
@@ -807,6 +853,8 @@ def _normalise_signal(raw: dict[str, Any]) -> dict[str, Any]:
         "z_r4": float(raw["z_r4"]),
         "z_oi4": float(raw["z_oi4"]),
         "bar": bar.strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(bar, "strftime") else str(bar),
+        # غيابها = 0: force_signals اليدوي وأي نداء قديم يبقى يعمل كما هو.
+        "late_bars": int(raw.get("late_bars") or 0),
     }
 
 
@@ -826,6 +874,30 @@ def process_entries(
         symbol = str(raw.get("symbol", "?"))
         try:
             signal = _normalise_signal(raw)
+
+            # حدّ عمر الإشارة المتأخّرة — أول فحص لأنه الأرخص (بلا Redis ولا
+            # شبكة) ولأن إشارة قديمة مرفوضة أصلاً لا تستحق بقية الفحوص.
+            # العمر يُقاس وقت التنفيذ (now) لا وقت الفحص: الفحص يستغرق ~43
+            # ثانية ولا يُغيّر العمر عملياً، لكن الاتفاق المكتوب هو لحظة
+            # الدخول. وشمعة غير قابلة للتحليل تُرفض عند التأخّر: إشارة لا
+            # نعرف عمرها أخطر من إشارة فائتة.
+            if signal["late_bars"]:
+                bar_end = _bar_end_ts(signal["bar"])
+                age = None if bar_end is None else now - bar_end
+                if age is None or age > MAX_SIGNAL_AGE_SECONDS:
+                    result["skipped"].append({
+                        "symbol": symbol,
+                        "reason": "signal_too_old",
+                        "late_bars": signal["late_bars"],
+                        "signal_bar": signal["bar"],
+                        "age_minutes": None if age is None else round(age / 60, 1),
+                    })
+                    result["messages"].append(warn_message(
+                        f"تخطّي {symbol}: إشارة شمعة {signal['bar']} عمرها "
+                        f"{'غير معروف' if age is None else f'{age / 3600:.1f} ساعة'} "
+                        f"وهو فوق حد {MAX_SIGNAL_AGE_SECONDS // 3600} ساعة — لا لحاق"
+                    ))
+                    continue
 
             if open_count >= MAX_OPEN:
                 result["skipped"].append({"symbol": symbol, "reason": "max_open"})
@@ -913,6 +985,7 @@ def process_entries(
                 "qty": record["qty"],
                 "z_r4": record["z_r4"],
                 "z_oi4": record["z_oi4"],
+                "late_bars": record["late_bars"],
             })
             result["journal"].append(_journal_entry(record))
             result["messages"].append(buy_message(
@@ -920,6 +993,7 @@ def process_entries(
                 Decimal(record["entry_price"]),
                 record["z_r4"],
                 record["z_oi4"],
+                record["late_bars"],
             ))
 
         except Exception as exc:  # noqa: BLE001
