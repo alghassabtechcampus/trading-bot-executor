@@ -21,6 +21,10 @@ load_dotenv('.env')
 # خاص بها، فلا تلمس trade:* ولا pending:* ولا close_tracked_trade.
 import liq_flush
 
+# استراتيجية الاختراق + الحَكَم (البيتكوين اليومي). نفس العزل: bo:* في Redis،
+# وأوامر bo_، ولا تمر بـ close_tracked_trade.
+import breakout
+
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bybit-trading-server")
@@ -1300,6 +1304,41 @@ def liq_health():
     قراءة فقط: مفتاح Redis واحد، بلا أي نداء لـ Bybit.
     """
     return jsonify(liq_flush.health(sys.modules[__name__])), 200
+
+
+@app.route("/bo_tick", methods=["POST"])
+@protected_route
+def bo_tick():
+    """النبضة الساعية لاستراتيجية الاختراق (breakout_btc) + تحديث الحَكَم.
+
+    n8n يناديها كل ساعة (الدقيقة 3، بعد liq_tick). الدخول على شموع 4 ساعات
+    مغلقة فقط، فأغلب النبضات لا تنتج شيئاً — وهذا مقصود: النبضة الساعية تلحق
+    نبضة فائتة، وتفحص الخروج بأسرع ما يمكن بعد إغلاق كل شمعة 4 ساعات.
+    لا ترمي استثناءً: الأخطاء تعود في errors[] بـ 200.
+    """
+    payload = request.get_json(silent=True) or {}
+    return jsonify(breakout.run_tick(sys.modules[__name__], payload)), 200
+
+
+@app.route("/bo_positions", methods=["GET"])
+@protected_route
+def bo_positions():
+    """مراكز الاختراق المفتوحة مع الوقف الحالي وحالة الحَكَم."""
+    return jsonify(breakout.list_positions(sys.modules[__name__])), 200
+
+
+@app.route("/bo_health", methods=["GET"])
+@protected_route
+def bo_health():
+    """متى وصلت آخر نبضة bo_tick وكم عمرها."""
+    return jsonify(breakout.health(sys.modules[__name__])), 200
+
+
+@app.route("/regime", methods=["GET"])
+@protected_route
+def regime():
+    """آخر حالة محفوظة للحَكَم (BTC يومي صاعد أو لا). قراءة فقط من Redis."""
+    return jsonify(breakout.read_regime(sys.modules[__name__])), 200
 
 
 @app.errorhandler(Exception)

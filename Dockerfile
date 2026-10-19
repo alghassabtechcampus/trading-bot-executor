@@ -44,6 +44,10 @@ ENV PYTHONUNBUFFERED=1
 # أرقاماً حية لا تطابق ما اختُبر.
 COPY liq_signal.py liq_flush.py .
 
+# استراتيجية الاختراق + الحَكَم: bo_signal.py الرياضيات (بلا pandas)، وbreakout.py
+# التنفيذ. تُنادى من /bo_tick في نفس خدمة الويب.
+COPY bo_signal.py breakout.py .
+
 EXPOSE 5000
 
 # استخدم gunicorn في الـ production

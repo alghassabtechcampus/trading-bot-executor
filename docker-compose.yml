@@ -28,6 +28,11 @@ services:
       # (cooldown, caps, 24h exit) is exercised without touching the real keys.
       LIQ_DRY_RUN: "${LIQ_DRY_RUN:-false}"
       LIQ_USDT_PER_TRADE: "${LIQ_USDT_PER_TRADE:-10}"
+      # breakout_btc (الاختراق + الحَكَم). نفس فكرة المفاتيح أعلاه: false افتراضياً
+      # في الكود أيضاً، والإيقاف يمنع الدخول ويكمل الخروج. راجع handoff/BREAKOUT_AR.md.
+      BO_ENABLED: "${BO_ENABLED:-false}"
+      BO_DRY_RUN: "${BO_DRY_RUN:-false}"
+      BO_USDT_PER_TRADE: "${BO_USDT_PER_TRADE:-10}"
     ports:
       - "5000:5000"
     # CMD from the Dockerfile (gunicorn app:app) is used as-is. Note its
